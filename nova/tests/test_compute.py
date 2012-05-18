@@ -115,7 +115,7 @@ class BaseTestCase(test.TestCase):
         test_notifier.NOTIFICATIONS = []
 
         def fake_show(meh, context, id):
-            return {'id': 1, 'min_disk': None, 'min_ram': None,
+            return {'id': id, 'min_disk': None, 'min_ram': None,
                     'properties': {'kernel_id': 'fake_kernel_id',
                                    'ramdisk_id': 'fake_ramdisk_id',
                                    'something_else': 'meow'}}
@@ -1661,7 +1661,7 @@ class ComputeTestCase(BaseTestCase):
         self.compute._last_host_check = 0
         self.mox.ReplayAll()
 
-        self.compute._report_driver_status(context)
+        self.compute._report_driver_status(context.get_admin_context())
         caps = self.compute.last_capabilities
         all_caps = dict(test1=1024, test2='foo', test3='xyzzy',
                         test4=True, nothertest='bar')
@@ -1801,6 +1801,181 @@ class ComputeTestCase(BaseTestCase):
         # Stays the same, beacuse the instance came from the DB
         self.assertEqual(call_info['get_by_uuid'], 3)
         self.assertEqual(call_info['get_nw_info'], 4)
+
+    def test_poll_unconfirmed_resizes(self):
+        instances = [{'uuid': 'fake_uuid1', 'vm_state': vm_states.ACTIVE,
+                      'task_state': task_states.RESIZE_VERIFY},
+                     {'uuid': 'noexist'},
+                     {'uuid': 'fake_uuid2', 'vm_state': vm_states.ERROR,
+                      'task_state': task_states.RESIZE_VERIFY},
+                     {'uuid': 'fake_uuid3', 'vm_state': vm_states.ACTIVE,
+                      'task_state': task_states.REBOOTING},
+                     {'uuid': 'fake_uuid4', 'vm_state': vm_states.ACTIVE,
+                      'task_state': task_states.RESIZE_VERIFY},
+                     {'uuid': 'fake_uuid5', 'vm_state': vm_states.ACTIVE,
+                      'task_state': task_states.RESIZE_VERIFY}]
+        expected_migration_status = {'fake_uuid1': 'confirmed',
+                                     'noexist': 'error',
+                                     'fake_uuid2': 'error',
+                                     'fake_uuid3': 'error',
+                                     'fake_uuid4': None,
+                                     'fake_uuid5': 'confirmed'}
+        migrations = []
+        for i, instance in enumerate(instances, start=1):
+            migrations.append({'id': i,
+                               'instance_uuid': instance['uuid'],
+                               'status': None})
+
+        def fake_instance_get_by_uuid(context, instance_uuid):
+            # raise InstanceNotFound exception for uuid 'noexist'
+            if instance_uuid == 'noexist':
+                raise exception.InstanceNotFound(instance_id=instance_uuid)
+            for instance in instances:
+                if instance['uuid'] == instance_uuid:
+                    return instance
+
+        def fake_migration_get_all_unconfirmed(context, resize_confirm_window):
+            return migrations
+
+        def fake_migration_update(context, migration_id, values):
+            for migration in migrations:
+                if migration['id'] == migration_id and 'status' in values:
+                    migration['status'] = values['status']
+
+        def fake_confirm_resize(context, instance):
+            # raise exception for 'fake_uuid4' to check migration status
+            # does not get set to 'error' on confirm_resize failure.
+            if instance['uuid'] == 'fake_uuid4':
+                raise test.TestingException
+            for migration in migrations:
+                if migration['instance_uuid'] == instance['uuid']:
+                    migration['status'] = 'confirmed'
+
+        self.stubs.Set(db, 'instance_get_by_uuid',
+                fake_instance_get_by_uuid)
+        self.stubs.Set(db, 'migration_get_all_unconfirmed',
+                fake_migration_get_all_unconfirmed)
+        self.stubs.Set(db, 'migration_update',
+                fake_migration_update)
+        self.stubs.Set(self.compute.compute_api, 'confirm_resize',
+                fake_confirm_resize)
+
+        def fetch_instance_migration_status(instance_uuid):
+            for migration in migrations:
+                if migration['instance_uuid'] == instance_uuid:
+                    return migration['status']
+
+        self.flags(resize_confirm_window=60)
+        ctxt = context.get_admin_context()
+
+        self.compute._poll_unconfirmed_resizes(ctxt)
+
+        for uuid, status in expected_migration_status.iteritems():
+            self.assertEqual(status, fetch_instance_migration_status(uuid))
+
+    def test_instance_build_timeout_disabled(self):
+        self.flags(instance_build_timeout=0)
+        ctxt = context.get_admin_context()
+        called = {'get_all': False, 'set_error_state': 0}
+        created_at = utils.utcnow() + datetime.timedelta(seconds=-60)
+
+        def fake_instance_get_all_by_filters(*args, **kwargs):
+            called['get_all'] = True
+            return instances[:]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                fake_instance_get_all_by_filters)
+
+        def fake_set_instance_error_state(_ctxt, instance_uuid, **kwargs):
+            called['set_error_state'] += 1
+
+        self.stubs.Set(self.compute, '_set_instance_error_state',
+                fake_set_instance_error_state)
+
+        instance_map = {}
+        instances = []
+        for x in xrange(5):
+            uuid = 'fake-uuid-%s' % x
+            instance_map[uuid] = {'uuid': uuid, 'host': FLAGS.host,
+                    'vm_state': vm_states.BUILDING,
+                    'created_at': created_at}
+            instances.append(instance_map[uuid])
+
+        self.compute._check_instance_build_time(ctxt)
+        self.assertFalse(called['get_all'])
+        self.assertEqual(called['set_error_state'], 0)
+
+    def test_instance_build_timeout(self):
+        self.flags(instance_build_timeout=30)
+        ctxt = context.get_admin_context()
+        called = {'get_all': False, 'set_error_state': 0}
+        created_at = utils.utcnow() + datetime.timedelta(seconds=-60)
+
+        def fake_instance_get_all_by_filters(*args, **kwargs):
+            called['get_all'] = True
+            return instances[:]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                fake_instance_get_all_by_filters)
+
+        def fake_set_instance_error_state(_ctxt, instance_uuid, **kwargs):
+            called['set_error_state'] += 1
+
+        self.stubs.Set(self.compute, '_set_instance_error_state',
+                fake_set_instance_error_state)
+
+        instance_map = {}
+        instances = []
+        for x in xrange(5):
+            uuid = 'fake-uuid-%s' % x
+            instance_map[uuid] = {'uuid': uuid, 'host': FLAGS.host,
+                    'vm_state': vm_states.BUILDING,
+                    'created_at': created_at}
+            instances.append(instance_map[uuid])
+
+        self.compute._check_instance_build_time(ctxt)
+        self.assertTrue(called['get_all'])
+        self.assertEqual(called['set_error_state'], 5)
+
+    def test_instance_build_timeout_mixed_instances(self):
+        self.flags(instance_build_timeout=30)
+        ctxt = context.get_admin_context()
+        called = {'get_all': False, 'set_error_state': 0}
+        created_at = utils.utcnow() + datetime.timedelta(seconds=-60)
+
+        def fake_instance_get_all_by_filters(*args, **kwargs):
+            called['get_all'] = True
+            return instances[:]
+
+        self.stubs.Set(db, 'instance_get_all_by_filters',
+                fake_instance_get_all_by_filters)
+
+        def fake_set_instance_error_state(_ctxt, instance_uuid, **kwargs):
+            called['set_error_state'] += 1
+
+        self.stubs.Set(self.compute, '_set_instance_error_state',
+                fake_set_instance_error_state)
+
+        instance_map = {}
+        instances = []
+        #expired instances
+        for x in xrange(4):
+            uuid = 'fake-uuid-%s' % x
+            instance_map[uuid] = {'uuid': uuid, 'host': FLAGS.host,
+                    'vm_state': vm_states.BUILDING,
+                    'created_at': created_at}
+            instances.append(instance_map[uuid])
+
+        #not expired
+        uuid = 'fake-uuid-5'
+        instance_map[uuid] = {'uuid': uuid, 'host': FLAGS.host,
+                'vm_state': vm_states.BUILDING,
+                'created_at': utils.utcnow()}
+        instances.append(instance_map[uuid])
+
+        self.compute._check_instance_build_time(ctxt)
+        self.assertTrue(called['get_all'])
+        self.assertEqual(called['set_error_state'], 4)
 
 
 class ComputeAPITestCase(BaseTestCase):
@@ -2236,6 +2411,15 @@ class ComputeAPITestCase(BaseTestCase):
 
         instance = db.instance_get_by_uuid(self.context, instance_uuid)
         self.assertEqual(instance['task_state'], None)
+        # Set some image metadata that should get wiped out and reset
+        # as well as some other metadata that should be preserved.
+        db.instance_system_metadata_update(self.context, instance_uuid,
+                {'image_kernel_id': 'old-data',
+                 'image_ramdisk_id': 'old_data',
+                 'image_something_else': 'old-data',
+                 'image_should_remove': 'bye-bye',
+                 'preserved': 'preserve this!'},
+                True)
 
         # Make sure Compute API updates the image_ref before casting to
         # compute manager.
@@ -2256,7 +2440,13 @@ class ComputeAPITestCase(BaseTestCase):
 
         instance = db.instance_get_by_uuid(self.context, instance_uuid)
         self.assertEqual(instance['vm_state'], vm_states.REBUILDING)
-
+        sys_metadata = db.instance_system_metadata_get(self.context,
+                instance_uuid)
+        self.assertEqual(sys_metadata,
+                {'image_kernel_id': 'fake_kernel_id',
+                 'image_ramdisk_id': 'fake_ramdisk_id',
+                 'image_something_else': 'meow',
+                 'preserved': 'preserve this!'})
         db.instance_destroy(self.context, instance['id'])
 
     def test_reboot_soft(self):
@@ -3872,3 +4062,105 @@ class ComputeHostAPITestCase(BaseTestCase):
         self.assertEqual(call_info['msg'],
                 {'method': 'host_maintenance_mode',
                  'args': {'host': 'fake_host', 'mode': 'fake_mode'}})
+
+
+class KeypairAPITestCase(BaseTestCase):
+    def setUp(self):
+        super(KeypairAPITestCase, self).setUp()
+        self.keypair_api = compute_api.KeypairAPI()
+        self.ctxt = context.RequestContext('fake', 'fake')
+        self._keypair_db_call_stubs()
+        self.pub_key = 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDLnVkqJu9WVf' \
+                  '/5StU3JCrBR2r1s1j8K1tux+5XeSvdqaM8lMFNorzbY5iyoBbRS56gy' \
+                  '1jmm43QsMPJsrpfUZKcJpRENSe3OxIIwWXRoiapZe78u/a9xKwj0avF' \
+                  'YMcws9Rk9iAB7W4K1nEJbyCPl5lRBoyqeHBqrnnuXWEgGxJCK0Ah6wc' \
+                  'OzwlEiVjdf4kxzXrwPHyi7Ea1qvnNXTziF8yYmUlH4C8UXfpTQckwSw' \
+                  'pDyxZUc63P8q+vPbs3Q2kw+/7vvkCKHJAXVI+oCiyMMfffoTq16M1xf' \
+                  'V58JstgtTqAXG+ZFpicGajREUE/E3hO5MGgcHmyzIrWHKpe1n3oEGuz'
+        self.fingerprint = '4e:48:c6:a0:4a:f9:dd:b5:4c:85:54:5a:af:43:47:5a'
+
+    def _keypair_db_call_stubs(self):
+
+        def db_key_pair_get_all_by_user(self, user_id):
+            return []
+
+        def db_key_pair_create(self, keypair):
+            pass
+
+        def db_key_pair_destroy(context, user_id, name):
+            pass
+
+        self.stubs.Set(db, "key_pair_get_all_by_user",
+                       db_key_pair_get_all_by_user)
+        self.stubs.Set(db, "key_pair_create",
+                       db_key_pair_create)
+        self.stubs.Set(db, "key_pair_destroy",
+                       db_key_pair_destroy)
+
+    def test_create_keypair(self):
+        keypair = self.keypair_api.create_key_pair(self.ctxt,
+                                                   self.ctxt.user_id, 'foo')
+        self.assertEqual('foo', keypair['name'])
+
+    def test_create_keypair_name_too_long(self):
+        self.assertRaises(exception.InvalidKeypair,
+                          self.keypair_api.create_key_pair,
+                          self.ctxt, self.ctxt.user_id, 'x' * 256)
+
+    def test_create_keypair_invalid_chars(self):
+        self.assertRaises(exception.InvalidKeypair,
+                          self.keypair_api.create_key_pair,
+                          self.ctxt, self.ctxt.user_id, '* BAD CHARACTERS! *')
+
+    def test_create_keypair_already_exists(self):
+        def db_key_pair_get(context, user_id, name):
+            pass
+        self.stubs.Set(db, "key_pair_get",
+                       db_key_pair_get)
+        self.assertRaises(exception.KeyPairExists,
+                          self.keypair_api.create_key_pair,
+                          self.ctxt, self.ctxt.user_id, 'foo')
+
+    def test_create_keypair_quota_limit(self):
+        def db_key_pair_count_by_user_max(self, user_id):
+            return FLAGS.quota_key_pairs
+        self.stubs.Set(db, "key_pair_count_by_user",
+                       db_key_pair_count_by_user_max)
+        self.assertRaises(exception.KeypairLimitExceeded,
+                          self.keypair_api.create_key_pair,
+                          self.ctxt, self.ctxt.user_id, 'foo')
+
+    def test_import_keypair(self):
+        keypair = self.keypair_api.import_key_pair(self.ctxt,
+                                                   self.ctxt.user_id,
+                                                   'foo',
+                                                   self.pub_key)
+        self.assertEqual('foo', keypair['name'])
+        self.assertEqual(self.fingerprint, keypair['fingerprint'])
+        self.assertEqual(self.pub_key, keypair['public_key'])
+
+    def test_import_keypair_bad_public_key(self):
+        self.assertRaises(exception.InvalidKeypair,
+                          self.keypair_api.import_key_pair,
+                          self.ctxt, self.ctxt.user_id, 'foo', 'bad key data')
+
+    def test_import_keypair_name_too_long(self):
+        self.assertRaises(exception.InvalidKeypair,
+                          self.keypair_api.import_key_pair,
+                          self.ctxt, self.ctxt.user_id, 'x' * 256,
+                          self.pub_key)
+
+    def test_import_keypair_invalid_chars(self):
+        self.assertRaises(exception.InvalidKeypair,
+                          self.keypair_api.import_key_pair,
+                          self.ctxt, self.ctxt.user_id,
+                          '* BAD CHARACTERS! *', self.pub_key)
+
+    def test_import_keypair_quota_limit(self):
+        def db_key_pair_count_by_user_max(self, user_id):
+            return FLAGS.quota_key_pairs
+        self.stubs.Set(db, "key_pair_count_by_user",
+                       db_key_pair_count_by_user_max)
+        self.assertRaises(exception.KeypairLimitExceeded,
+                          self.keypair_api.import_key_pair,
+                          self.ctxt, self.ctxt.user_id, 'foo', self.pub_key)

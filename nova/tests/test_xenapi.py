@@ -102,7 +102,6 @@ class XenAPIVolumeTestCase(test.TestCase):
                 firewall_driver='nova.virt.xenapi.firewall.'
                                 'Dom0IptablesFirewallDriver')
         db_fakes.stub_out_db_instance_api(self.stubs)
-        stubs.stub_out_get_target(self.stubs)
         xenapi_fake.reset()
         self.instance_values = {'id': 1,
                   'project_id': self.user_id,
@@ -844,7 +843,6 @@ class XenAPIMigrateInstance(test.TestCase):
                                 'Dom0IptablesFirewallDriver')
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         db_fakes.stub_out_db_instance_api(self.stubs)
-        stubs.stub_out_get_target(self.stubs)
         xenapi_fake.reset()
         xenapi_fake.create_network('fake', FLAGS.flat_network_bridge)
         self.user_id = 'fake'
@@ -877,98 +875,6 @@ class XenAPIMigrateInstance(test.TestCase):
         stubs.stub_out_migration_methods(self.stubs)
         stubs.stubout_get_this_vm_uuid(self.stubs)
         glance_stubs.stubout_glance_client(self.stubs)
-
-    def test_poll_unconfirmed_resizes(self):
-        """Test all migrations are checked despite errors when
-        autoconfirming resizes.
-        """
-        conn = xenapi_conn.get_connection(False)
-
-        self.mox.StubOutWithMock(context, 'get_admin_context')
-        self.mox.StubOutWithMock(db, 'migration_get_all_unconfirmed')
-        self.mox.StubOutWithMock(db, 'instance_get_by_uuid')
-        self.mox.StubOutWithMock(db, 'migration_update')
-        self.mox.StubOutWithMock(vmops.LOG, 'info')
-        self.mox.StubOutWithMock(vmops.LOG, 'warn')
-        self.mox.StubOutWithMock(vmops.LOG, 'error')
-        self.mox.StubOutWithMock(conn._vmops.compute_api, 'confirm_resize')
-
-        fake_context = 'fake-context'
-        instances = [{'uuid': 'fake_uuid1', 'vm_state': vm_states.ACTIVE,
-                      'task_state': task_states.RESIZE_VERIFY},
-                     {'uuid': 'noexist'},
-                     {'uuid': 'fake_uuid2', 'vm_state': vm_states.ERROR,
-                      'task_state': task_states.RESIZE_VERIFY},
-                     {'uuid': 'fake_uuid3', 'vm_state': vm_states.ACTIVE,
-                      'task_state': task_states.REBOOTING},
-                     {'uuid': 'fake_uuid4', 'vm_state': vm_states.ACTIVE,
-                      'task_state': task_states.RESIZE_VERIFY},
-                     {'uuid': 'fake_uuid5', 'vm_state': vm_states.ACTIVE,
-                      'task_state': task_states.RESIZE_VERIFY}]
-
-        migrations = []
-        for i, instance in enumerate(instances, start=1):
-            migrations.append({'id': i, 'instance_uuid': instance['uuid']})
-        resize_confirm_window = 60
-
-        context.get_admin_context().AndReturn(fake_context)
-        db.migration_get_all_unconfirmed(fake_context,
-                resize_confirm_window).AndReturn(migrations)
-        # Found unconfirmed migrations message
-        vmops.LOG.info(mox.IgnoreArg())
-
-        # test success (ACTIVE/RESIZE_VERIFY)
-        instance = instances.pop(0)
-        vmops.LOG.info(mox.IgnoreArg(), mox.IgnoreArg())
-        db.instance_get_by_uuid(fake_context,
-                instance['uuid']).AndReturn(instance)
-        conn._vmops.compute_api.confirm_resize(fake_context,
-                instance)
-
-        # test instance that doesn't exist anymore sets migration to
-        # error
-        instance = instances.pop(0)
-        vmops.LOG.info(mox.IgnoreArg(), mox.IgnoreArg())
-        db.instance_get_by_uuid(fake_context,
-                instance['uuid']).AndRaise(exception.InstanceNotFound)
-        vmops.LOG.warn(mox.IgnoreArg())
-        db.migration_update(fake_context, 2, {'status': 'error'})
-
-        # test instance in ERROR/RESIZE_VERIFY sets migration to error
-        instance = instances.pop(0)
-        vmops.LOG.info(mox.IgnoreArg(), mox.IgnoreArg())
-        db.instance_get_by_uuid(fake_context,
-                instance['uuid']).AndReturn(instance)
-        vmops.LOG.warn(mox.IgnoreArg(), instance=instance)
-        db.migration_update(fake_context, 3, {'status': 'error'})
-
-        # test instance in ACTIVE/REBOOTING sets migration to error
-        instance = instances.pop(0)
-        vmops.LOG.info(mox.IgnoreArg(), mox.IgnoreArg())
-        db.instance_get_by_uuid(fake_context,
-                instance['uuid']).AndReturn(instance)
-        vmops.LOG.warn(mox.IgnoreArg(), instance=instance)
-        db.migration_update(fake_context, 4, {'status': 'error'})
-
-        # test confirm_resize raises and doesn't set migration to error
-        instance = instances.pop(0)
-        vmops.LOG.info(mox.IgnoreArg(), mox.IgnoreArg())
-        db.instance_get_by_uuid(fake_context,
-                instance['uuid']).AndReturn(instance)
-        conn._vmops.compute_api.confirm_resize(fake_context,
-                instance).AndRaise(test.TestingException)
-        vmops.LOG.error(mox.IgnoreArg(), instance=instance)
-
-        # test succeeds again (ACTIVE/RESIZE_VERIFY)
-        instance = instances.pop(0)
-        vmops.LOG.info(mox.IgnoreArg(), mox.IgnoreArg())
-        db.instance_get_by_uuid(fake_context,
-                instance['uuid']).AndReturn(instance)
-        conn._vmops.compute_api.confirm_resize(fake_context,
-                instance)
-
-        self.mox.ReplayAll()
-        conn._vmops.poll_unconfirmed_resizes(resize_confirm_window)
 
     def test_resize_xenserver_6(self):
         instance = db.instance_create(self.context, self.instance_values)
@@ -1792,7 +1698,6 @@ class XenAPISRSelectionTestCase(test.TestCase):
     """Unit tests for testing we find the right SR."""
     def setUp(self):
         super(XenAPISRSelectionTestCase, self).setUp()
-        stubs.stub_out_get_target(self.stubs)
         xenapi_fake.reset()
 
     def test_safe_find_sr_raise_exception(self):

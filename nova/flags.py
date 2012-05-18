@@ -30,19 +30,19 @@ import os
 import socket
 import sys
 
-from nova.compat import flagfile
 from nova.openstack.common import cfg
 
 
 class NovaConfigOpts(cfg.CommonConfigOpts):
 
     def __init__(self, *args, **kwargs):
+        if 'project' not in kwargs:
+            kwargs['project'] = 'nova'
         super(NovaConfigOpts, self).__init__(*args, **kwargs)
         self.disable_interspersed_args()
 
     def __call__(self, argv):
-        with flagfile.handle_flagfiles_managed(argv[1:]) as args:
-            return argv[:1] + super(NovaConfigOpts, self).__call__(args)
+        return argv[:1] + super(NovaConfigOpts, self).__call__(argv[1:])
 
 
 FLAGS = NovaConfigOpts()
@@ -408,7 +408,7 @@ global_opts = [
     cfg.BoolOpt('enable_instance_password',
                 default=True,
                 help='Allows use of instance password during '
-                       'server creation'),
+                     'server creation'),
     cfg.IntOpt('password_length',
                default=12,
                help='Length of generated instance admin passwords'),
@@ -425,9 +425,9 @@ global_opts = [
                 default=False,
                 help='Allow destination machine to match source for resize. '
                      'Useful when testing in single-host environments.'),
-    cfg.StrOpt('stub_network',
-               default=False,
-               help='Stub network related code'),
+    cfg.BoolOpt('stub_network',
+                default=False,
+                help='Stub network related code'),
     cfg.IntOpt('reclaim_instance_interval',
                default=0,
                help='Interval in seconds for reclaiming deleted instances'),

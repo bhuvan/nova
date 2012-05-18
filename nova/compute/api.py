@@ -3,6 +3,7 @@
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
 # Copyright 2011 Piston Cloud Computing, Inc.
+# Copyright 2012 Red Hat, Inc.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -23,6 +24,7 @@ networking and storage of vms, and compute hosts on which they run)."""
 import functools
 import re
 import time
+import string
 
 from nova import block_device
 from nova.compute import aggregate_states
@@ -30,6 +32,7 @@ from nova.compute import instance_types
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import vm_states
+from nova import crypto
 from nova.db import base
 from nova import exception
 from nova import flags
@@ -37,6 +40,7 @@ import nova.image
 from nova import log as logging
 from nova import network
 from nova.openstack.common import cfg
+from nova.openstack.common import jsonutils
 import nova.policy
 from nova import quota
 from nova import rpc
@@ -47,12 +51,7 @@ from nova import volume
 
 LOG = logging.getLogger(__name__)
 
-find_host_timeout_opt = cfg.StrOpt('find_host_timeout',
-        default=30,
-        help='Timeout after NN seconds when looking for a host.')
-
 FLAGS = flags.FLAGS
-FLAGS.register_opt(find_host_timeout_opt)
 flags.DECLARE('consoleauth_topic', 'nova.consoleauth')
 
 
@@ -649,7 +648,7 @@ class API(BaseAPI):
                 locals())
 
         request_spec = {
-            'image': utils.to_primitive(image),
+            'image': jsonutils.to_primitive(image),
             'instance_properties': base_options,
             'instance_type': instance_type,
             'num_instances': num_instances,
@@ -1350,6 +1349,32 @@ class API(BaseAPI):
         if instance_type['root_gb'] < int(image.get('min_disk') or 0):
             raise exception.InstanceTypeDiskTooSmall()
 
+        def _reset_image_metadata():
+            """
+            Remove old image properties that we're storing as instance
+            system metadata.  These properties start with 'image_'.
+            Then add the properites for the new image.
+            """
+
+            # FIXME(comstud): There's a race condition here in that
+            # if the system_metadata for this instance is updated
+            # after we do the get and before we update.. those other
+            # updates will be lost. Since this problem exists in a lot
+            # of other places, I think it should be addressed in a DB
+            # layer overhaul.
+            sys_metadata = self.db.instance_system_metadata_get(context,
+                    instance['uuid'])
+            # Remove the old keys
+            for key in sys_metadata.keys():
+                if key.startswith('image_'):
+                    del sys_metadata[key]
+            # Add the new ones
+            for key, value in image['properties'].iteritems():
+                new_value = str(value)[:255]
+                sys_metadata['image_%s' % key] = new_value
+            self.db.instance_system_metadata_update(context,
+                    instance['uuid'], sys_metadata, True)
+
         self.update(context,
                     instance,
                     vm_state=vm_states.REBUILDING,
@@ -1359,6 +1384,11 @@ class API(BaseAPI):
                     task_state=None,
                     progress=0,
                     **kwargs)
+
+        # On a rebuild, since we're potentially changing images, we need to
+        # wipe out the old image properties that we're storing as instance
+        # system metadata... and copy in the properties for the new image.
+        _reset_image_metadata()
 
         rebuild_params = {
             "new_pass": admin_password,
@@ -1479,7 +1509,7 @@ class API(BaseAPI):
             "instance_type_id": new_instance_type['id'],
             "image": image,
             "update_db": False,
-            "request_spec": utils.to_primitive(request_spec),
+            "request_spec": jsonutils.to_primitive(request_spec),
             "filter_properties": filter_properties,
         }
         self._cast_scheduler_message(context,
@@ -1756,6 +1786,11 @@ class API(BaseAPI):
         uuids = [instance['uuid'] for instance in instances]
         return self.db.instance_fault_get_by_instance_uuids(context, uuids)
 
+    def get_instance_bdms(self, context, instance):
+        """Get all bdm tables for specified instance."""
+        return self.db.block_device_mapping_get_all_by_instance(context,
+                instance['uuid'])
+
 
 class HostAPI(BaseAPI):
     """Sub-set of the Compute Manager API for managing host operations."""
@@ -1908,3 +1943,83 @@ class AggregateAPI(base.Base):
         result["metadata"] = metadata
         result["hosts"] = hosts
         return result
+
+
+class KeypairAPI(base.Base):
+    """Sub-set of the Compute Manager API for managing key pairs."""
+    def __init__(self, **kwargs):
+        super(KeypairAPI, self).__init__(**kwargs)
+
+    def _validate_keypair_name(self, context, user_id, key_name):
+        safechars = "_- " + string.digits + string.ascii_letters
+        clean_value = "".join(x for x in key_name if x in safechars)
+        if clean_value != key_name:
+            msg = _("Keypair name contains unsafe characters")
+            raise exception.InvalidKeypair(explanation=msg)
+
+        if not 0 < len(key_name) < 256:
+            msg = _('Keypair name must be between 1 and 255 characters long')
+            raise exception.InvalidKeypair(explanation=msg)
+
+        # NOTE: check for existing keypairs of same name
+        try:
+            self.db.key_pair_get(context, user_id, key_name)
+            msg = _("Key pair '%s' already exists.") % key_name
+            raise exception.KeyPairExists(explanation=msg)
+        except exception.NotFound:
+            pass
+
+    def import_key_pair(self, context, user_id, key_name, public_key):
+        """Import a key pair using an existing public key."""
+        self._validate_keypair_name(context, user_id, key_name)
+
+        if quota.allowed_key_pairs(context, 1) < 1:
+            raise exception.KeypairLimitExceeded()
+
+        try:
+            fingerprint = crypto.generate_fingerprint(public_key)
+        except exception.InvalidKeypair:
+            msg = _("Keypair data is invalid")
+            raise exception.InvalidKeypair(explanation=msg)
+
+        keypair = {'user_id': user_id,
+                   'name': key_name,
+                   'fingerprint': fingerprint,
+                   'public_key': public_key}
+
+        self.db.key_pair_create(context, keypair)
+        return keypair
+
+    def create_key_pair(self, context, user_id, key_name):
+        """Create a new key pair."""
+        self._validate_keypair_name(context, user_id, key_name)
+
+        if quota.allowed_key_pairs(context, 1) < 1:
+            raise exception.KeypairLimitExceeded()
+
+        private_key, public_key, fingerprint = crypto.generate_key_pair()
+
+        keypair = {'user_id': user_id,
+                   'name': key_name,
+                   'fingerprint': fingerprint,
+                   'public_key': public_key,
+                   'private_key': private_key}
+        self.db.key_pair_create(context, keypair)
+
+        return keypair
+
+    def delete_key_pair(self, context, user_id, key_name):
+        """Delete a keypair by name."""
+        self.db.key_pair_destroy(context, user_id, key_name)
+
+    def get_key_pairs(self, context, user_id):
+        """List key pairs."""
+        key_pairs = self.db.key_pair_get_all_by_user(context, user_id)
+        rval = []
+        for key_pair in key_pairs:
+            rval.append({
+                'name': key_pair['name'],
+                'public_key': key_pair['public_key'],
+                'fingerprint': key_pair['fingerprint'],
+            })
+        return rval

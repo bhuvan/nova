@@ -282,10 +282,6 @@ class InvalidCidr(Invalid):
     message = _("Invalid cidr %(cidr)s.")
 
 
-class InvalidRPCConnectionReuse(Invalid):
-    message = _("Invalid reuse of an RPC connection.")
-
-
 class InvalidUnicodeParameter(Invalid):
     message = _("Invalid Parameter: "
                 "Unicode is not supported by the current database.")
@@ -693,8 +689,21 @@ class AccessKeyNotFound(NotFound):
     message = _("Access Key %(access_key)s could not be found.")
 
 
+class InvalidReservationExpiration(Invalid):
+    message = _("Invalid reservation expiration %(expire)s.")
+
+
+class InvalidQuotaValue(Invalid):
+    message = _("Change would make usage less than 0 for the following "
+                "resources: %(unders)s")
+
+
 class QuotaNotFound(NotFound):
     message = _("Quota could not be found")
+
+
+class QuotaResourceUnknown(QuotaNotFound):
+    message = _("Unknown quota resources %(unknown)s.")
 
 
 class ProjectQuotaNotFound(QuotaNotFound):
@@ -703,6 +712,18 @@ class ProjectQuotaNotFound(QuotaNotFound):
 
 class QuotaClassNotFound(QuotaNotFound):
     message = _("Quota class %(class_name)s could not be found.")
+
+
+class QuotaUsageNotFound(QuotaNotFound):
+    message = _("Quota usage for project %(project_id)s could not be found.")
+
+
+class ReservationNotFound(QuotaNotFound):
+    message = _("Quota reservation %(uuid)s could not be found.")
+
+
+class OverQuota(NovaException):
+    message = _("Quota exceeded for resources: %(overs)s")
 
 
 class SecurityGroupNotFound(NotFound):
@@ -991,6 +1012,10 @@ class OnsetFilePathLimitExceeded(QuotaError):
 
 class OnsetFileContentLimitExceeded(QuotaError):
     message = _("Personality file content too long")
+
+
+class KeypairLimitExceeded(QuotaError):
+    message = _("Maximum number of key pairs exceeded")
 
 
 class AggregateError(NovaException):
