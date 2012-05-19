@@ -40,8 +40,8 @@ Supports KVM, LXC, QEMU, UML, and XEN.
 
 import errno
 import functools
-import hashlib
 import glob
+import hashlib
 import multiprocessing
 import os
 import shutil
@@ -66,9 +66,10 @@ from nova import log as logging
 from nova.openstack.common import cfg
 from nova.openstack.common import excutils
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 from nova import utils
-from nova.virt import driver
 from nova.virt.disk import api as disk
+from nova.virt import driver
 from nova.virt.libvirt import config
 from nova.virt.libvirt import firewall
 from nova.virt.libvirt import imagecache
@@ -864,27 +865,6 @@ class LibvirtConnection(driver.ComputeDriver):
     @exception.wrap_exception()
     def poll_rescued_instances(self, timeout):
         pass
-
-    @exception.wrap_exception()
-    def poll_unconfirmed_resizes(self, resize_confirm_window):
-        """Poll for unconfirmed resizes.
-
-        Look for any unconfirmed resizes that are older than
-        `resize_confirm_window` and automatically confirm them.
-        """
-        ctxt = nova_context.get_admin_context()
-        migrations = db.migration_get_all_unconfirmed(ctxt,
-            resize_confirm_window)
-
-        if migrations:
-            LOG.info(_("Found %(migration_count)d unconfirmed migrations "
-                    "older than %(confirm_window)d seconds") %
-                     {'migration_count': len(migrations),
-                      'confirm_window': resize_confirm_window})
-
-        for migration in migrations:
-            LOG.info(_("Automatically confirming migration %d"), migration.id)
-            self.compute_api.confirm_resize(ctxt, migration.instance_uuid)
 
     def _enable_hairpin(self, instance):
         interfaces = self.get_interfaces(instance['name'])
@@ -1844,10 +1824,15 @@ class LibvirtConnection(driver.ComputeDriver):
         if sys.platform.upper() not in ['LINUX2', 'LINUX3']:
             return 0
 
-        meminfo = open('/proc/meminfo').read().split()
-        idx = meminfo.index('MemTotal:')
-        # transforming kb to mb.
-        return int(meminfo[idx + 1]) / 1024
+        if FLAGS.libvirt_type == 'xen':
+            meminfo = self._conn.getInfo()[1]
+            # this is in MB
+            return meminfo
+        else:
+            meminfo = open('/proc/meminfo').read().split()
+            idx = meminfo.index('MemTotal:')
+            # transforming KB to MB
+            return int(meminfo[idx + 1]) / 1024
 
     @staticmethod
     def get_local_gb_total():
@@ -1896,8 +1881,26 @@ class LibvirtConnection(driver.ComputeDriver):
         idx1 = m.index('MemFree:')
         idx2 = m.index('Buffers:')
         idx3 = m.index('Cached:')
-        avail = (int(m[idx1 + 1]) + int(m[idx2 + 1]) + int(m[idx3 + 1])) / 1024
-        return  self.get_memory_mb_total() - avail
+        if FLAGS.libvirt_type == 'xen':
+            used = 0
+            for domain_id in self._conn.listDomainsID():
+                # skip dom0
+                dom_mem = int(self._conn.lookupByID(domain_id).info()[2])
+                if domain_id != 0:
+                    used += dom_mem
+                else:
+                    # the mem reported by dom0 is be greater of what
+                    # it is being used
+                    used += (dom_mem -
+                             (int(m[idx1 + 1]) +
+                              int(m[idx2 + 1]) +
+                              int(m[idx3 + 1])))
+            # Convert it to MB
+            return used / 1024
+        else:
+            avail = (int(m[idx1 + 1]) + int(m[idx2 + 1]) + int(m[idx3 + 1]))
+            # Convert it to MB
+            return  self.get_memory_mb_total() - avail / 1024
 
     def get_local_gb_used(self):
         """Get the free hdd size(GB) of physical computer.
@@ -1940,6 +1943,10 @@ class LibvirtConnection(driver.ComputeDriver):
             # NOTE(justinsb): This would then rely on a proper version check
 
         return method()
+
+    def get_hypervisor_hostname(self):
+        """Returns the hostname of the hypervisor."""
+        return self._conn.getHostname()
 
     def get_cpu_info(self):
         """Get cpuinfo information.
@@ -1994,7 +2001,7 @@ class LibvirtConnection(driver.ComputeDriver):
 
         cpu_info['topology'] = topology
         cpu_info['features'] = features
-        return utils.dumps(cpu_info)
+        return jsonutils.dumps(cpu_info)
 
     def block_stats(self, instance_name, disk):
         """
@@ -2052,6 +2059,7 @@ class LibvirtConnection(driver.ComputeDriver):
                'local_gb_used': self.get_local_gb_used(),
                'hypervisor_type': self.get_hypervisor_type(),
                'hypervisor_version': self.get_hypervisor_version(),
+               'hypervisor_hostname': self.get_hypervisor_hostname(),
                'cpu_info': self.get_cpu_info(),
                'service_id': service_ref['id'],
                'disk_available_least': self.get_disk_available_least()}
@@ -2079,7 +2087,7 @@ class LibvirtConnection(driver.ComputeDriver):
 
         """
 
-        info = utils.loads(cpu_info)
+        info = jsonutils.loads(cpu_info)
         LOG.info(_('Instance launched has CPU info:\n%s') % cpu_info)
         cpu = config.LibvirtConfigCPU()
         cpu.arch = info['arch']
@@ -2254,7 +2262,7 @@ class LibvirtConnection(driver.ComputeDriver):
             json strings specified in get_instance_disk_info
 
         """
-        disk_info = utils.loads(disk_info_json)
+        disk_info = jsonutils.loads(disk_info_json)
 
         # make instance directory
         instance_dir = os.path.join(FLAGS.instances_path, instance_ref['name'])
@@ -2391,7 +2399,7 @@ class LibvirtConnection(driver.ComputeDriver):
                               'virt_disk_size': virt_size,
                               'backing_file': backing_file,
                               'disk_size': dk_size})
-        return utils.dumps(disk_info)
+        return jsonutils.dumps(disk_info)
 
     def get_disk_available_least(self):
         """Return disk available least size.
@@ -2411,7 +2419,8 @@ class LibvirtConnection(driver.ComputeDriver):
         instances_sz = 0
         for i_name in instances_name:
             try:
-                disk_infos = utils.loads(self.get_instance_disk_info(i_name))
+                disk_infos = jsonutils.loads(
+                        self.get_instance_disk_info(i_name))
                 for info in disk_infos:
                     i_vt_sz = int(info['virt_disk_size'])
                     i_dk_sz = int(info['disk_size'])
@@ -2472,7 +2481,7 @@ class LibvirtConnection(driver.ComputeDriver):
         LOG.debug(_("Starting migrate_disk_and_power_off"),
                    instance=instance)
         disk_info_text = self.get_instance_disk_info(instance['name'])
-        disk_info = utils.loads(disk_info_text)
+        disk_info = jsonutils.loads(disk_info_text)
 
         self._destroy(instance, network_info, cleanup=False)
 
@@ -2538,7 +2547,7 @@ class LibvirtConnection(driver.ComputeDriver):
         LOG.debug(_("Starting finish_migration"), instance=instance)
 
         # resize disks. only "disk" and "disk.local" are necessary.
-        disk_info = utils.loads(disk_info)
+        disk_info = jsonutils.loads(disk_info)
         for info in disk_info:
             fname = os.path.basename(info['path'])
             if fname == 'disk':
@@ -2624,7 +2633,7 @@ class HostState(object):
         data = {}
         data["vcpus"] = self.connection.get_vcpu_total()
         data["vcpus_used"] = self.connection.get_vcpu_used()
-        data["cpu_info"] = utils.loads(self.connection.get_cpu_info())
+        data["cpu_info"] = jsonutils.loads(self.connection.get_cpu_info())
         data["disk_total"] = self.connection.get_local_gb_total()
         data["disk_used"] = self.connection.get_local_gb_used()
         data["disk_available"] = data["disk_total"] - data["disk_used"]
@@ -2633,6 +2642,7 @@ class HostState(object):
                                     self.connection.get_memory_mb_used())
         data["hypervisor_type"] = self.connection.get_hypervisor_type()
         data["hypervisor_version"] = self.connection.get_hypervisor_version()
+        data["hypervisor_hostname"] = self.connection.get_hypervisor_hostname()
 
         self._stats = data
 

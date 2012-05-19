@@ -167,10 +167,6 @@ class _VirtDriverTestCase(test.TestCase):
         self.connection.poll_rescued_instances(10)
 
     @catch_notimplementederror
-    def test_poll_unconfirmed_resizes(self):
-        self.connection.poll_unconfirmed_resizes(10)
-
-    @catch_notimplementederror
     def test_migrate_disk_and_power_off(self):
         instance_ref, network_info = self._get_running_instance()
         instance_type_ref = test_utils.get_test_instance_type()
@@ -440,8 +436,8 @@ class LibvirtConnTestCase(_VirtDriverTestCase):
         else:
             self.saved_libvirt = None
 
-        import fakelibvirt
         import fake_libvirt_utils
+        import fakelibvirt
 
         sys.modules['libvirt'] = fakelibvirt
 

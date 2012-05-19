@@ -65,10 +65,11 @@ from nova.network import model as network_model
 from nova.notifier import api as notifier
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 import nova.policy
 from nova import quota
-from nova import utils
 from nova import rpc
+from nova import utils
 
 
 LOG = logging.getLogger(__name__)
@@ -194,7 +195,7 @@ class RPCAllocateFixedIP(object):
                 host = rpc.call(context, FLAGS.network_topic,
                                 {'method': 'set_network_host',
                                  'args': {'network_ref':
-                                 utils.to_primitive(network)}})
+                                 jsonutils.to_primitive(network)}})
             if host != self.host:
                 # need to call allocate_fixed_ip to correct network host
                 topic = self.db.queue_get_for(context,

@@ -46,13 +46,14 @@ import traceback
 from eventlet import greenthread
 
 from nova import block_device
-import nova.context
+from nova import compute
 from nova.compute import aggregate_states
 from nova.compute import instance_types
 from nova.compute import power_state
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
+import nova.context
 from nova import exception
 from nova import flags
 import nova.image
@@ -64,6 +65,7 @@ from nova.notifier import api as notifier
 from nova.openstack.common import cfg
 from nova.openstack.common import excutils
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
 from nova import rpc
 from nova import utils
 from nova.virt import driver
@@ -93,6 +95,11 @@ compute_opts = [
                default=0,
                help="Automatically hard reboot an instance if it has been "
                     "stuck in a rebooting state longer than N seconds. "
+                    "Set to 0 to disable."),
+    cfg.IntOpt("instance_build_timeout",
+               default=0,
+               help="Amount of time in seconds an instance can be in BUILD "
+                    "before going into ERROR status."
                     "Set to 0 to disable."),
     cfg.IntOpt("rescue_timeout",
                default=0,
@@ -237,6 +244,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         self._last_host_check = 0
         self._last_bw_usage_poll = 0
         self._last_info_cache_heal = 0
+        self.compute_api = compute.API()
 
         super(ComputeManager, self).__init__(service_name="compute",
                                              *args, **kwargs)
@@ -397,7 +405,7 @@ class ComputeManager(manager.SchedulerDependentManager):
                                                  bdm['device_name'])
                 self.db.block_device_mapping_update(
                         context, bdm['id'],
-                        {'connection_info': utils.dumps(cinfo)})
+                        {'connection_info': jsonutils.dumps(cinfo)})
                 block_device_mapping.append({'connection_info': cinfo,
                                              'mount_device':
                                              bdm['device_name']})
@@ -446,6 +454,22 @@ class ComputeManager(manager.SchedulerDependentManager):
         except Exception as e:
             with excutils.save_and_reraise_exception():
                 self._set_instance_error_state(context, instance_uuid)
+
+    @manager.periodic_task
+    def _check_instance_build_time(self, context):
+        """Ensure that instances are not stuck in build."""
+        if FLAGS.instance_build_timeout == 0:
+            return
+
+        filters = {'vm_state': vm_states.BUILDING}
+        building_insts = self.db.instance_get_all_by_filters(context, filters)
+
+        for instance in building_insts:
+            if utils.is_older_than(instance['created_at'],
+                                   FLAGS.instance_build_timeout):
+                self._set_instance_error_state(context, instance['uuid'])
+                LOG.warn(_("Instance build timed out. Set to error state."),
+                         instance=instance)
 
     def _update_access_ip(self, context, instance, nw_info):
         """Update the access ip values for a given instance.
@@ -635,7 +659,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         bdms = self._get_instance_volume_bdms(context, instance_uuid)
         block_device_mapping = []
         for bdm in bdms:
-            cinfo = utils.loads(bdm['connection_info'])
+            cinfo = jsonutils.loads(bdm['connection_info'])
             block_device_mapping.append({'connection_info': cinfo,
                                          'mount_device':
                                          bdm['device_name']})
@@ -1343,7 +1367,14 @@ class ComputeManager(manager.SchedulerDependentManager):
         instance_type_ref = self.db.instance_type_get(context,
                 migration_ref.new_instance_type_id)
 
-        network_info = self._get_instance_nw_info(context, instance_ref)
+        try:
+            network_info = self._get_instance_nw_info(context, instance_ref)
+        except Exception, error:
+            with utils.save_and_reraise_exception():
+                msg = _('%s. Setting instance vm_state to ERROR')
+                LOG.error(msg % error)
+                self._set_instance_error_state(context, instance_uuid)
+
         self.db.migration_update(context,
                                  migration_id,
                                  {'status': 'migrating'})
@@ -1775,7 +1806,7 @@ class ComputeManager(manager.SchedulerDependentManager):
                                mountpoint)
         values = {
             'instance_uuid': instance_ref['uuid'],
-            'connection_info': utils.dumps(connection_info),
+            'connection_info': jsonutils.dumps(connection_info),
             'device_name': mountpoint,
             'delete_on_termination': False,
             'virtual_name': None,
@@ -1799,7 +1830,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         if instance_name not in self.driver.list_instances():
             LOG.warn(_('Detaching volume from unknown instance'),
                      context=context, instance=instance)
-        self.driver.detach_volume(utils.loads(bdm['connection_info']),
+        self.driver.detach_volume(jsonutils.loads(bdm['connection_info']),
                                   instance_name,
                                   mp)
 
@@ -2278,7 +2309,57 @@ class ComputeManager(manager.SchedulerDependentManager):
     @manager.periodic_task
     def _poll_unconfirmed_resizes(self, context):
         if FLAGS.resize_confirm_window > 0:
-            self.driver.poll_unconfirmed_resizes(FLAGS.resize_confirm_window)
+            migrations = self.db.migration_get_all_unconfirmed(context,
+                    FLAGS.resize_confirm_window)
+
+            migrations_info = dict(migration_count=len(migrations),
+                    confirm_window=FLAGS.resize_confirm_window)
+
+            if migrations_info["migration_count"] > 0:
+                LOG.info(_("Found %(migration_count)d unconfirmed migrations "
+                           "older than %(confirm_window)d seconds"),
+                         migrations_info)
+
+            def _set_migration_to_error(migration_id, reason, **kwargs):
+                msg = _("Setting migration %(migration_id)s to error: "
+                       "%(reason)s") % locals()
+                LOG.warn(msg, **kwargs)
+                self.db.migration_update(context, migration_id,
+                                        {'status': 'error'})
+
+            for migration in migrations:
+                # NOTE(comstud): Yield to other greenthreads.  Putting this
+                # at the top so we make sure to do it on each iteration.
+                greenthread.sleep(0)
+                migration_id = migration['id']
+                instance_uuid = migration['instance_uuid']
+                LOG.info(_("Automatically confirming migration "
+                           "%(migration_id)s for instance %(instance_uuid)s"),
+                           locals())
+                try:
+                    instance = self.db.instance_get_by_uuid(context,
+                                                            instance_uuid)
+                except exception.InstanceNotFound:
+                    reason = _("Instance %(instance_uuid)s not found")
+                    _set_migration_to_error(migration_id, reason % locals())
+                    continue
+                if instance['vm_state'] == vm_states.ERROR:
+                    reason = _("In ERROR state")
+                    _set_migration_to_error(migration_id, reason % locals(),
+                                            instance=instance)
+                    continue
+                if instance['task_state'] != task_states.RESIZE_VERIFY:
+                    state = instance['task_state']
+                    reason = _("In %(state)s task_state, not RESIZE_VERIFY")
+                    _set_migration_to_error(migration_id, reason % locals(),
+                                            instance=instance)
+                    continue
+                try:
+                    self.compute_api.confirm_resize(context, instance)
+                except Exception, e:
+                    msg = _("Error auto-confirming resize: %(e)s. "
+                            "Will retry later.")
+                    LOG.error(msg % locals(), instance=instance)
 
     @manager.periodic_task
     def _poll_bandwidth_usage(self, context, start_time=None, stop_time=None):
