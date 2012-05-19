@@ -1,6 +1,7 @@
 *.pyc
 *.DS_Store
 local_settings.py
+ChangeLog
 CA/
 keeper
 instances
