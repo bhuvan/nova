@@ -40,18 +40,18 @@ from nova import log as logging
 from nova.openstack.common import importutils
 from nova.openstack.common import jsonutils
 from nova import test
-from nova.tests import fake_network
 from nova.tests import fake_libvirt_utils
+from nova.tests import fake_network
 from nova import utils
-from nova.virt import images
 from nova.virt import driver
 from nova.virt import firewall as base_firewall
+from nova.virt import images
 from nova.virt.libvirt import config
 from nova.virt.libvirt import connection
 from nova.virt.libvirt import firewall
+from nova.virt.libvirt import utils as libvirt_utils
 from nova.virt.libvirt import volume
 from nova.volume import driver as volume_driver
-from nova.virt.libvirt import utils as libvirt_utils
 
 
 try:
@@ -1696,6 +1696,9 @@ class HostStateTestCase(test.TestCase):
         def get_hypervisor_version(self):
             return 13091
 
+        def get_hypervisor_hostname(self):
+            return 'compute1'
+
         def get_disk_available_least(self):
             return 13091
 
@@ -1722,6 +1725,7 @@ class HostStateTestCase(test.TestCase):
         self.assertEquals(stats["host_memory_free"], 409)
         self.assertEquals(stats["hypervisor_type"], 'QEMU')
         self.assertEquals(stats["hypervisor_version"], 13091)
+        self.assertEquals(stats["hypervisor_hostname"], 'compute1')
 
 
 class NWFilterFakes:

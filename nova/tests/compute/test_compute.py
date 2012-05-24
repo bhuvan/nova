@@ -28,11 +28,12 @@ import mox
 import nova
 import nova.common.policy
 from nova import compute
-from nova.compute import api as compute_api
 from nova.compute import aggregate_states
+from nova.compute import api as compute_api
 from nova.compute import instance_types
 from nova.compute import manager as compute_manager
 from nova.compute import power_state
+from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import vm_states
 from nova import context
@@ -44,6 +45,7 @@ from nova import log as logging
 from nova.notifier import test_notifier
 from nova.openstack.common import importutils
 import nova.policy
+from nova import quota
 from nova import rpc
 from nova.rpc import common as rpc_common
 from nova.scheduler import driver as scheduler_driver
@@ -53,6 +55,7 @@ from nova import utils
 import nova.volume
 
 
+QUOTAS = quota.QUOTAS
 LOG = logging.getLogger(__name__)
 FLAGS = flags.FLAGS
 flags.DECLARE('stub_network', 'nova.compute.manager')
@@ -70,13 +73,14 @@ def rpc_call_wrapper(context, topic, msg, do_cast=True):
     if (topic == FLAGS.scheduler_topic and
         msg['method'] == 'run_instance'):
         request_spec = msg['args']['request_spec']
+        reservations = msg['args'].get('reservations')
         scheduler = scheduler_driver.Scheduler
         num_instances = request_spec.get('num_instances', 1)
         instances = []
         for num in xrange(num_instances):
             request_spec['instance_properties']['launch_index'] = num
             instance = scheduler().create_instance_db_entry(
-                    context, request_spec)
+                    context, request_spec, reservations)
             encoded = scheduler_driver.encode_instance(instance)
             instances.append(encoded)
         return instances
@@ -147,6 +151,7 @@ class BaseTestCase(test.TestCase):
         inst['instance_type_id'] = type_id
         inst['ami_launch_index'] = 0
         inst['memory_mb'] = 0
+        inst['vcpus'] = 0
         inst['root_gb'] = 0
         inst['ephemeral_gb'] = 0
         inst.update(params)
@@ -2807,15 +2812,14 @@ class ComputeAPITestCase(BaseTestCase):
         self.compute.terminate_instance(context, instance['uuid'])
 
     def test_resize_request_spec(self):
-        def _fake_cast(context, args):
-            request_spec = args['args']['request_spec']
-            filter_properties = args['args']['filter_properties']
+        def _fake_cast(context, topic, msg):
+            request_spec = msg['args']['request_spec']
+            filter_properties = msg['args']['filter_properties']
             instance_properties = request_spec['instance_properties']
             self.assertEqual(instance_properties['host'], 'host2')
             self.assertIn('host2', filter_properties['ignore_hosts'])
 
-        self.stubs.Set(self.compute_api, '_cast_scheduler_message',
-                _fake_cast)
+        self.stubs.Set(rpc, 'cast', _fake_cast)
 
         context = self.context.elevated()
         instance = self._create_fake_instance(dict(host='host2'))
@@ -2827,15 +2831,14 @@ class ComputeAPITestCase(BaseTestCase):
             self.compute.terminate_instance(context, instance['uuid'])
 
     def test_resize_request_spec_noavoid(self):
-        def _fake_cast(context, args):
-            request_spec = args['args']['request_spec']
-            filter_properties = args['args']['filter_properties']
+        def _fake_cast(context, topic, msg):
+            request_spec = msg['args']['request_spec']
+            filter_properties = msg['args']['filter_properties']
             instance_properties = request_spec['instance_properties']
             self.assertEqual(instance_properties['host'], 'host2')
             self.assertNotIn('host2', filter_properties['ignore_hosts'])
 
-        self.stubs.Set(self.compute_api, '_cast_scheduler_message',
-                _fake_cast)
+        self.stubs.Set(rpc, 'cast', _fake_cast)
         self.flags(allow_resize_to_same_host=True)
 
         context = self.context.elevated()
@@ -3484,26 +3487,24 @@ class ComputeAPITestCase(BaseTestCase):
                              'console_type': fake_console_type,
                              'host': 'fake_console_host',
                              'port': 'fake_console_port',
-                             'internal_access_path': 'fake_access_path',
-                             'access_url': 'fake_console_url'}
+                             'internal_access_path': 'fake_access_path'}
+        fake_connect_info2 = copy.deepcopy(fake_connect_info)
+        fake_connect_info2['access_url'] = 'fake_console_url'
 
         self.mox.StubOutWithMock(rpc, 'call')
 
         rpc_msg1 = {'method': 'get_vnc_console',
                     'args': {'instance_uuid': fake_instance['uuid'],
-                             'console_type': fake_console_type}}
-        # 2nd rpc.call receives almost everything from fake_connect_info
-        # except 'access_url'
-        rpc_msg2_args = dict([(k, v)
-                for k, v in fake_connect_info.items()
-                        if k != 'access_url'])
+                             'console_type': fake_console_type},
+                   'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION}
         rpc_msg2 = {'method': 'authorize_console',
-                    'args': rpc_msg2_args}
+                    'args': fake_connect_info,
+                    'version': '1.0'}
 
         rpc.call(self.context, 'compute.%s' % fake_instance['host'],
-                rpc_msg1).AndReturn(fake_connect_info)
+                rpc_msg1, None).AndReturn(fake_connect_info2)
         rpc.call(self.context, FLAGS.consoleauth_topic,
-                rpc_msg2).AndReturn(None)
+                rpc_msg2, None).AndReturn(None)
 
         self.mox.ReplayAll()
 
@@ -3521,9 +3522,10 @@ class ComputeAPITestCase(BaseTestCase):
 
         rpc_msg = {'method': 'get_console_output',
                    'args': {'instance_uuid': fake_instance['uuid'],
-                            'tail_length': fake_tail_length}}
+                            'tail_length': fake_tail_length},
+                   'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION}
         rpc.call(self.context, 'compute.%s' % fake_instance['host'],
-                rpc_msg).AndReturn(fake_console_output)
+                rpc_msg, None).AndReturn(fake_console_output)
 
         self.mox.ReplayAll()
 
@@ -4023,7 +4025,7 @@ class ComputeHostAPITestCase(BaseTestCase):
         self.host_api = compute_api.HostAPI()
 
     def _rpc_call_stub(self, call_info):
-        def fake_rpc_call(context, topic, msg):
+        def fake_rpc_call(context, topic, msg, timeout=None):
             call_info['context'] = context
             call_info['topic'] = topic
             call_info['msg'] = msg
@@ -4039,7 +4041,8 @@ class ComputeHostAPITestCase(BaseTestCase):
         self.assertEqual(call_info['topic'], 'compute.fake_host')
         self.assertEqual(call_info['msg'],
                 {'method': 'set_host_enabled',
-                 'args': {'enabled': 'fake_enabled'}})
+                 'args': {'enabled': 'fake_enabled'},
+                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION})
 
     def test_host_power_action(self):
         ctxt = context.RequestContext('fake', 'fake')
@@ -4050,7 +4053,8 @@ class ComputeHostAPITestCase(BaseTestCase):
         self.assertEqual(call_info['topic'], 'compute.fake_host')
         self.assertEqual(call_info['msg'],
                 {'method': 'host_power_action',
-                 'args': {'action': 'fake_action'}})
+                 'args': {'action': 'fake_action'},
+                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION})
 
     def test_set_host_maintenance(self):
         ctxt = context.RequestContext('fake', 'fake')
@@ -4061,7 +4065,8 @@ class ComputeHostAPITestCase(BaseTestCase):
         self.assertEqual(call_info['topic'], 'compute.fake_host')
         self.assertEqual(call_info['msg'],
                 {'method': 'host_maintenance_mode',
-                 'args': {'host': 'fake_host', 'mode': 'fake_mode'}})
+                 'args': {'host': 'fake_host', 'mode': 'fake_mode'},
+                 'version': compute_rpcapi.ComputeAPI.RPC_API_VERSION})
 
 
 class KeypairAPITestCase(BaseTestCase):
@@ -4122,10 +4127,9 @@ class KeypairAPITestCase(BaseTestCase):
                           self.ctxt, self.ctxt.user_id, 'foo')
 
     def test_create_keypair_quota_limit(self):
-        def db_key_pair_count_by_user_max(self, user_id):
+        def fake_quotas_count(self, context, resource, *args, **kwargs):
             return FLAGS.quota_key_pairs
-        self.stubs.Set(db, "key_pair_count_by_user",
-                       db_key_pair_count_by_user_max)
+        self.stubs.Set(QUOTAS, "count", fake_quotas_count)
         self.assertRaises(exception.KeypairLimitExceeded,
                           self.keypair_api.create_key_pair,
                           self.ctxt, self.ctxt.user_id, 'foo')
@@ -4157,10 +4161,9 @@ class KeypairAPITestCase(BaseTestCase):
                           '* BAD CHARACTERS! *', self.pub_key)
 
     def test_import_keypair_quota_limit(self):
-        def db_key_pair_count_by_user_max(self, user_id):
+        def fake_quotas_count(self, context, resource, *args, **kwargs):
             return FLAGS.quota_key_pairs
-        self.stubs.Set(db, "key_pair_count_by_user",
-                       db_key_pair_count_by_user_max)
+        self.stubs.Set(QUOTAS, "count", fake_quotas_count)
         self.assertRaises(exception.KeypairLimitExceeded,
                           self.keypair_api.import_key_pair,
                           self.ctxt, self.ctxt.user_id, 'foo', self.pub_key)

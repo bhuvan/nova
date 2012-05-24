@@ -23,15 +23,17 @@ networking and storage of vms, and compute hosts on which they run)."""
 
 import functools
 import re
-import time
 import string
+import time
 
 from nova import block_device
 from nova.compute import aggregate_states
 from nova.compute import instance_types
 from nova.compute import power_state
+from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import vm_states
+from nova.consoleauth import rpcapi as consoleauth_rpcapi
 from nova import crypto
 from nova.db import base
 from nova import exception
@@ -40,11 +42,12 @@ import nova.image
 from nova import log as logging
 from nova import network
 from nova.openstack.common import cfg
+from nova.openstack.common import excutils
 from nova.openstack.common import jsonutils
 import nova.policy
 from nova import quota
 from nova import rpc
-from nova.scheduler import api as scheduler_api
+from nova.scheduler import rpcapi as scheduler_rpcapi
 from nova import utils
 from nova import volume
 
@@ -53,6 +56,8 @@ LOG = logging.getLogger(__name__)
 
 FLAGS = flags.FLAGS
 flags.DECLARE('consoleauth_topic', 'nova.consoleauth')
+
+QUOTAS = quota.QUOTAS
 
 
 def check_instance_state(vm_state=None, task_state=None):
@@ -102,57 +107,7 @@ def check_policy(context, action, target):
     nova.policy.enforce(context, _action, target)
 
 
-class BaseAPI(base.Base):
-    """Base API class."""
-    def __init__(self, **kwargs):
-        super(BaseAPI, self).__init__(**kwargs)
-
-    def _cast_or_call_compute_message(self, rpc_method, compute_method,
-            context, instance=None, host=None, params=None):
-        """Generic handler for RPC casts and calls to compute.
-
-        :param rpc_method: RPC method to use (rpc.call or rpc.cast)
-        :param compute_method: Compute manager method to call
-        :param context: RequestContext of caller
-        :param instance: The instance object to use to find host to send to
-                         Can be None to not include instance_uuid in args
-        :param host: Optional host to send to instead of instance['host']
-                     Must be specified if 'instance' is None
-        :param params: Optional dictionary of arguments to be passed to the
-                       compute worker
-
-        :returns: None
-        """
-        if not params:
-            params = {}
-        if not host:
-            if not instance:
-                raise exception.NovaException(_("No compute host specified"))
-            host = instance['host']
-            if not host:
-                raise exception.NovaException(_("Unable to find host for "
-                                        "Instance %s") % instance['uuid'])
-        queue = self.db.queue_get_for(context, FLAGS.compute_topic, host)
-        if instance:
-            params['instance_uuid'] = instance['uuid']
-        kwargs = {'method': compute_method, 'args': params}
-        return rpc_method(context, queue, kwargs)
-
-    def _cast_compute_message(self, *args, **kwargs):
-        """Generic handler for RPC casts to compute."""
-        self._cast_or_call_compute_message(rpc.cast, *args, **kwargs)
-
-    def _call_compute_message(self, *args, **kwargs):
-        """Generic handler for RPC calls to compute."""
-        return self._cast_or_call_compute_message(rpc.call, *args, **kwargs)
-
-    @staticmethod
-    def _cast_scheduler_message(context, args):
-        """Generic handler for RPC calls to the scheduler."""
-        rpc.cast(context, FLAGS.scheduler_topic, args)
-
-
-class API(BaseAPI):
+class API(base.Base):
     """API for interacting with the compute manager."""
 
     def __init__(self, image_service=None, network_api=None, volume_api=None,
@@ -162,6 +117,9 @@ class API(BaseAPI):
 
         self.network_api = network_api or network.API()
         self.volume_api = volume_api or volume.API()
+        self.consoleauth_rpcapi = consoleauth_rpcapi.ConsoleAuthAPI()
+        self.scheduler_rpcapi = scheduler_rpcapi.SchedulerAPI()
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         super(API, self).__init__(**kwargs)
 
     def _check_injected_file_quota(self, context, injected_files):
@@ -171,49 +129,91 @@ class API(BaseAPI):
         """
         if injected_files is None:
             return
-        limit = quota.allowed_injected_files(context, len(injected_files))
-        if len(injected_files) > limit:
+
+        # Check number of files first
+        try:
+            QUOTAS.limit_check(context, injected_files=len(injected_files))
+        except exception.OverQuota:
             raise exception.OnsetFileLimitExceeded()
-        path_limit = quota.allowed_injected_file_path_bytes(context)
+
+        # OK, now count path and content lengths; we're looking for
+        # the max...
+        max_path = 0
+        max_content = 0
         for path, content in injected_files:
-            if len(path) > path_limit:
+            max_path = max(max_path, len(path))
+            max_content = max(max_content, len(content))
+
+        try:
+            QUOTAS.limit_check(context, injected_file_path_bytes=max_path,
+                               injected_file_content_bytes=max_content)
+        except exception.OverQuota as exc:
+            # Favor path limit over content limit for reporting
+            # purposes
+            if 'injected_file_path_bytes' in exc.kwargs['overs']:
                 raise exception.OnsetFilePathLimitExceeded()
-            content_limit = quota.allowed_injected_file_content_bytes(
-                                                    context, len(content))
-            if len(content) > content_limit:
+            else:
                 raise exception.OnsetFileContentLimitExceeded()
 
     def _check_num_instances_quota(self, context, instance_type, min_count,
                                    max_count):
         """Enforce quota limits on number of instances created."""
-        num_instances = quota.allowed_instances(context, max_count,
-                                                instance_type)
-        if num_instances < min_count:
+
+        # Determine requested cores and ram
+        req_cores = max_count * instance_type['vcpus']
+        req_ram = max_count * instance_type['memory_mb']
+
+        # Check the quota
+        try:
+            reservations = QUOTAS.reserve(context, instances=max_count,
+                                          cores=req_cores, ram=req_ram)
+        except exception.OverQuota as exc:
+            # OK, we exceeded quota; let's figure out why...
+            quotas = exc.kwargs['quotas']
+            usages = exc.kwargs['usages']
+            headroom = dict((res, quotas[res] -
+                             (usages[res]['in_use'] + usages[res]['reserved']))
+                            for res in quotas.keys())
+            allowed = headroom['instances']
+            if instance_type['vcpus']:
+                allowed = min(allowed,
+                              headroom['cores'] // instance_type['vcpus'])
+            if instance_type['memory_mb']:
+                allowed = min(allowed,
+                              headroom['ram'] // instance_type['memory_mb'])
+
+            # Convert to the appropriate exception message
             pid = context.project_id
-            if num_instances <= 0:
+            if allowed <= 0:
                 msg = _("Cannot run any more instances of this type.")
                 used = max_count
+            elif min_count <= allowed <= max_count:
+                # We're actually OK, but still need reservations
+                return self._check_num_instances_quota(context, instance_type,
+                                                       min_count, allowed)
             else:
                 msg = (_("Can only run %s more instances of this type.") %
-                       num_instances)
-                used = max_count - num_instances
+                       allowed)
+                used = max_count - allowed
             LOG.warn(_("Quota exceeded for %(pid)s,"
                   " tried to run %(min_count)s instances. %(msg)s"), locals())
             raise exception.TooManyInstances(used=used, allowed=max_count)
 
-        return num_instances
+        return max_count, reservations
 
     def _check_metadata_properties_quota(self, context, metadata=None):
         """Enforce quota limits on metadata properties."""
         if not metadata:
             metadata = {}
         num_metadata = len(metadata)
-        quota_metadata = quota.allowed_metadata_items(context, num_metadata)
-        if quota_metadata < num_metadata:
+        try:
+            QUOTAS.limit_check(context, metadata_items=num_metadata)
+        except exception.OverQuota as exc:
             pid = context.project_id
             msg = _("Quota exceeded for %(pid)s, tried to set "
                     "%(num_metadata)s metadata properties") % locals()
             LOG.warn(msg)
+            quota_metadata = exc.kwargs['quotas']['metadata_items']
             raise exception.MetadataLimitExceeded(allowed=quota_metadata)
 
         # Because metadata is stored in the DB, we hard-code the size limits
@@ -347,7 +347,7 @@ class API(BaseAPI):
         block_device_mapping = block_device_mapping or []
 
         # Check quotas
-        num_instances = self._check_num_instances_quota(
+        num_instances, quota_reservations = self._check_num_instances_quota(
                 context, instance_type, min_count, max_count)
         self._check_metadata_properties_quota(context, metadata)
         self._check_injected_file_quota(context, injected_files)
@@ -358,8 +358,10 @@ class API(BaseAPI):
         image = image_service.show(context, image_id)
 
         if instance_type['memory_mb'] < int(image.get('min_ram') or 0):
+            QUOTAS.rollback(context, quota_reservations)
             raise exception.InstanceTypeMemoryTooSmall()
         if instance_type['root_gb'] < int(image.get('min_disk') or 0):
+            QUOTAS.rollback(context, quota_reservations)
             raise exception.InstanceTypeDiskTooSmall()
 
         # Handle config_drive
@@ -430,15 +432,20 @@ class API(BaseAPI):
         if create_instance_here:
             instance = self.create_db_entry_for_new_instance(
                     context, instance_type, image, base_options,
-                    security_group, block_device_mapping)
+                    security_group, block_device_mapping,
+                    quota_reservations)
+
+            # Reservations committed; don't double-commit
+            quota_reservations = None
+
             # Tells scheduler we created the instance already.
             base_options['uuid'] = instance['uuid']
-            rpc_method = rpc.cast
+            use_call = False
         else:
             # We need to wait for the scheduler to create the instance
             # DB entries, because the instance *could* be # created in
             # a child zone.
-            rpc_method = rpc.call
+            use_call = True
 
         filter_properties = dict(scheduler_hints=scheduler_hints)
         if context.is_admin and forced_host:
@@ -450,14 +457,14 @@ class API(BaseAPI):
         # This would require the schedulers' schedule_run_instances
         # methods to return an iterator vs a list.
         instances = self._schedule_run_instance(
-                rpc_method,
+                use_call,
                 context, base_options,
                 instance_type,
                 availability_zone, injected_files,
                 admin_password, image,
                 num_instances, requested_networks,
                 block_device_mapping, security_group,
-                filter_properties)
+                filter_properties, quota_reservations)
 
         if create_instance_here:
             return ([instance], reservation_id)
@@ -554,7 +561,7 @@ class API(BaseAPI):
     #NOTE(bcwaldon): No policy check since this is only used by scheduler and
     # the compute api. That should probably be cleaned up, though.
     def create_db_entry_for_new_instance(self, context, instance_type, image,
-            base_options, security_group, block_device_mapping):
+            base_options, security_group, block_device_mapping, reservations):
         """Create an entry in the DB for this new instance,
         including any related table updates (such as security group,
         etc).
@@ -584,6 +591,11 @@ class API(BaseAPI):
 
         base_options.setdefault('launch_index', 0)
         instance = self.db.instance_create(context, base_options)
+
+        # Commit the reservations
+        if reservations:
+            QUOTAS.commit(context, reservations)
+
         instance_id = instance['id']
         instance_uuid = instance['uuid']
 
@@ -629,7 +641,7 @@ class API(BaseAPI):
         return "Server %s" % instance_id
 
     def _schedule_run_instance(self,
-            rpc_method,
+            use_call,
             context, base_options,
             instance_type,
             availability_zone, injected_files,
@@ -638,7 +650,8 @@ class API(BaseAPI):
             requested_networks,
             block_device_mapping,
             security_group,
-            filter_properties):
+            filter_properties,
+            quota_reservations):
         """Send a run_instance request to the schedulers for processing."""
 
         pid = context.project_id
@@ -656,16 +669,12 @@ class API(BaseAPI):
             'security_group': security_group,
         }
 
-        return rpc_method(context,
-                FLAGS.scheduler_topic,
-                {"method": "run_instance",
-                 "args": {"topic": FLAGS.compute_topic,
-                          "request_spec": request_spec,
-                          "admin_password": admin_password,
-                          "injected_files": injected_files,
-                          "requested_networks": requested_networks,
-                          "is_first_time": True,
-                          "filter_properties": filter_properties}})
+        return self.scheduler_rpcapi.run_instance(context,
+                topic=FLAGS.compute_topic, request_spec=request_spec,
+                admin_password=admin_password, injected_files=injected_files,
+                requested_networks=requested_networks, is_first_time=True,
+                filter_properties=filter_properties,
+                reservations=quota_reservations, call=use_call)
 
     def _check_create_policies(self, context, availability_zone,
             requested_networks, block_device_mapping):
@@ -769,10 +778,8 @@ class API(BaseAPI):
                 hosts.add(instance['host'])
 
         for host in hosts:
-            rpc.cast(context,
-                     self.db.queue_get_for(context, FLAGS.compute_topic, host),
-                     {"method": "refresh_security_group_rules",
-                      "args": {"security_group_id": security_group.id}})
+            self.compute_rpcapi.refresh_security_group_rules(context,
+                    security_group.id, host=host)
 
     def trigger_security_group_members_refresh(self, context, group_ids):
         """Called when a security group gains a new or loses a member.
@@ -812,10 +819,8 @@ class API(BaseAPI):
         # ...and finally we tell these nodes to refresh their view of this
         # particular security group.
         for host in hosts:
-            rpc.cast(context,
-                     self.db.queue_get_for(context, FLAGS.compute_topic, host),
-                     {"method": "refresh_security_group_members",
-                      "args": {"security_group_id": group_id}})
+            self.compute_rpcapi.refresh_security_group_members(context,
+                    group_id, host=host)
 
     def trigger_provider_fw_rules_refresh(self, context):
         """Called when a rule is added/removed from a provider firewall"""
@@ -869,11 +874,10 @@ class API(BaseAPI):
         self.db.instance_add_security_group(context.elevated(),
                                             instance_uuid,
                                             security_group['id'])
-        params = {"security_group_id": security_group['id']}
         # NOTE(comstud): No instance_uuid argument to this compute manager
         # call
-        self._cast_compute_message('refresh_security_group_rules',
-                context, host=instance['host'], params=params)
+        self.compute_rpcapi.refresh_security_group_rules(context,
+                security_group['id'], host=instance['host'])
 
     @wrap_check_policy
     def remove_security_group(self, context, instance, security_group_name):
@@ -898,11 +902,10 @@ class API(BaseAPI):
         self.db.instance_remove_security_group(context.elevated(),
                                                instance_uuid,
                                                security_group['id'])
-        params = {"security_group_id": security_group['id']}
         # NOTE(comstud): No instance_uuid argument to this compute manager
         # call
-        self._cast_compute_message('refresh_security_group_rules',
-                context, host=instance['host'], params=params)
+        self.compute_rpcapi.refresh_security_group_rules(context,
+                security_group['id'], host=instance['host'])
 
     @wrap_check_policy
     def update(self, context, instance, **kwargs):
@@ -933,16 +936,14 @@ class API(BaseAPI):
         # NOTE(jerdfelt): The compute daemon handles reclaiming instances
         # that are in soft delete. If there is no host assigned, there is
         # no daemon to reclaim, so delete it immediately.
-        host = instance['host']
-        if host:
+        if instance['host']:
             self.update(context,
                         instance,
                         vm_state=vm_states.SOFT_DELETE,
                         task_state=task_states.POWERING_OFF,
                         deleted_at=utils.utcnow())
 
-            self._cast_compute_message('power_off_instance',
-                    context, instance)
+            self.compute_rpcapi.power_off_instance(context, instance)
         else:
             LOG.warning(_('No host for instance, deleting immediately'),
                         instance=instance)
@@ -954,10 +955,16 @@ class API(BaseAPI):
 
     def _delete(self, context, instance):
         host = instance['host']
+        reservations = QUOTAS.reserve(context,
+                                      instances=-1,
+                                      cores=-instance['vcpus'],
+                                      ram=-instance['memory_mb'])
         try:
-            if not host:
+            if not instance['host']:
                 # Just update database, nothing else we can do
-                return self.db.instance_destroy(context, instance['id'])
+                result = self.db.instance_destroy(context, instance['id'])
+                QUOTAS.commit(context, reservations)
+                return result
 
             self.update(context,
                         instance,
@@ -971,17 +978,20 @@ class API(BaseAPI):
                         context, instance['uuid'], 'finished')
                 if migration_ref:
                     src_host = migration_ref['source_compute']
-                    params = {'migration_id': migration_ref['id']}
                     # Call since this can race with the terminate_instance
-                    self._call_compute_message('confirm_resize', context,
-                                               instance, host=src_host,
-                                               params=params)
+                    self.compute_rpcapi.confirm_resize(context,
+                            instance, migration_ref['id'],
+                            host=src_host, cast=False)
 
-            self._cast_compute_message('terminate_instance',
-                                       context, instance)
+            self.compute_rpcapi.terminate_instance(context, instance)
+
+            QUOTAS.commit(context, reservations)
         except exception.InstanceNotFound:
             # NOTE(comstud): Race condition. Instance already gone.
-            pass
+            QUOTAS.rollback(context, reservations)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                QUOTAS.rollback(context, reservations)
 
     # NOTE(jerdfelt): The API implies that only ACTIVE and ERROR are
     # allowed but the EC2 API appears to allow from RESCUED and STOPPED
@@ -1009,13 +1019,9 @@ class API(BaseAPI):
                     task_state=None,
                     deleted_at=None)
 
-        host = instance['host']
-        if host:
-            self.update(context,
-                        instance,
-                        task_state=task_states.POWERING_ON)
-            self._cast_compute_message('power_on_instance',
-                    context, instance)
+        if instance['host']:
+            self.update(context, instance, task_state=task_states.POWERING_ON)
+            self.compute_rpcapi.power_on_instance(context, instance)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.SOFT_DELETE])
@@ -1039,9 +1045,7 @@ class API(BaseAPI):
                     terminated_at=utils.utcnow(),
                     progress=0)
 
-        rpc_method = rpc.cast if do_cast else rpc.call
-        self._cast_or_call_compute_message(rpc_method, 'stop_instance',
-                context, instance)
+        self.compute_rpcapi.stop_instance(context, instance, cast=do_cast)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.STOPPED, vm_states.SHUTOFF])
@@ -1069,7 +1073,7 @@ class API(BaseAPI):
         # TODO(yamahata): injected_files isn't supported right now.
         #                 It is used only for osapi. not for ec2 api.
         #                 availability_zone isn't used by run_instance.
-        self._cast_compute_message('start_instance', context, instance)
+        self.compute_rpcapi.start_instance(context, instance)
 
     #NOTE(bcwaldon): no policy check here since it should be rolled in to
     # search_opts in get_all
@@ -1282,10 +1286,9 @@ class API(BaseAPI):
         sent_meta['properties'] = properties
 
         recv_meta = self.image_service.create(context, sent_meta)
-        params = {'image_id': recv_meta['id'], 'image_type': image_type,
-                  'backup_type': backup_type, 'rotation': rotation}
-        self._cast_compute_message('snapshot_instance', context, instance,
-                params=params)
+        self.compute_rpcapi.snapshot_instance(context, instance=instance,
+                image_id=recv_meta['id'], image_type=image_type,
+                backup_type=backup_type, rotation=rotation)
         return recv_meta
 
     def _get_minram_mindisk_params(self, context, instance):
@@ -1319,8 +1322,8 @@ class API(BaseAPI):
                     instance,
                     vm_state=vm_states.ACTIVE,
                     task_state=state)
-        self._cast_compute_message('reboot_instance', context, instance,
-                params={'reboot_type': reboot_type})
+        self.compute_rpcapi.reboot_instance(context, instance=instance,
+                reboot_type=reboot_type)
 
     def _get_image(self, context, image_href):
         """Throws an ImageNotFound exception if image_href does not exist."""
@@ -1390,15 +1393,9 @@ class API(BaseAPI):
         # system metadata... and copy in the properties for the new image.
         _reset_image_metadata()
 
-        rebuild_params = {
-            "new_pass": admin_password,
-            "injected_files": files_to_inject,
-            "image_ref": image_href,
-            "orig_image_ref": orig_image_ref,
-        }
-
-        self._cast_compute_message('rebuild_instance', context, instance,
-                params=rebuild_params)
+        self.compute_rpcapi.rebuild_instance(context, instance=instance,
+                new_pass=admin_password, injected_files=files_to_inject,
+                image_ref=image_href, orig_image_ref=orig_image_ref)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF],
@@ -1417,9 +1414,9 @@ class API(BaseAPI):
                     vm_state=vm_states.RESIZING,
                     task_state=task_states.RESIZE_REVERTING)
 
-        params = {'migration_id': migration_ref['id']}
-        self._cast_compute_message('revert_resize', context, instance,
-                host=migration_ref['dest_compute'], params=params)
+        self.compute_rpcapi.revert_resize(context,
+                instance=instance, migration_id=migration_ref['id'],
+                host=migration_ref['dest_compute'])
 
         self.db.migration_update(context, migration_ref['id'],
                                  {'status': 'reverted'})
@@ -1441,9 +1438,9 @@ class API(BaseAPI):
                     vm_state=vm_states.ACTIVE,
                     task_state=None)
 
-        params = {'migration_id': migration_ref['id']}
-        self._cast_compute_message('confirm_resize', context, instance,
-                host=migration_ref['source_compute'], params=params)
+        self.compute_rpcapi.confirm_resize(context,
+                instance=instance, migration_id=migration_ref['id'],
+                host=migration_ref['source_compute'])
 
         self.db.migration_update(context, migration_ref['id'],
                 {'status': 'confirmed'})
@@ -1512,21 +1509,19 @@ class API(BaseAPI):
             "request_spec": jsonutils.to_primitive(request_spec),
             "filter_properties": filter_properties,
         }
-        self._cast_scheduler_message(context,
-                    {"method": "prep_resize",
-                     "args": args})
+        self.scheduler_rpcapi.prep_resize(context, **args)
 
     @wrap_check_policy
     def add_fixed_ip(self, context, instance, network_id):
         """Add fixed_ip from specified network to given instance."""
-        self._cast_compute_message('add_fixed_ip_to_instance', context,
-                instance, params=dict(network_id=network_id))
+        self.compute_rpcapi.add_fixed_ip_to_instance(context,
+                instance=instance, network_id=network_id)
 
     @wrap_check_policy
     def remove_fixed_ip(self, context, instance, address):
         """Remove fixed_ip from specified network to given instance."""
-        self._cast_compute_message('remove_fixed_ip_from_instance',
-                context, instance, params=dict(address=address))
+        self.compute_rpcapi.remove_fixed_ip_from_instance(context,
+                instance=instance, address=address)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
@@ -1538,7 +1533,7 @@ class API(BaseAPI):
                     instance,
                     vm_state=vm_states.ACTIVE,
                     task_state=task_states.PAUSING)
-        self._cast_compute_message('pause_instance', context, instance)
+        self.compute_rpcapi.pause_instance(context, instance=instance)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.PAUSED])
@@ -1548,13 +1543,12 @@ class API(BaseAPI):
                     instance,
                     vm_state=vm_states.PAUSED,
                     task_state=task_states.UNPAUSING)
-        self._cast_compute_message('unpause_instance', context, instance)
+        self.compute_rpcapi.unpause_instance(context, instance=instance)
 
     @wrap_check_policy
     def get_diagnostics(self, context, instance):
         """Retrieve diagnostics for the given instance."""
-        return self._call_compute_message("get_diagnostics", context,
-                instance)
+        return self.compute_rpcapi.get_diagnostics(context, instance=instance)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
@@ -1566,7 +1560,7 @@ class API(BaseAPI):
                     instance,
                     vm_state=vm_states.ACTIVE,
                     task_state=task_states.SUSPENDING)
-        self._cast_compute_message('suspend_instance', context, instance)
+        self.compute_rpcapi.suspend_instance(context, instance=instance)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.SUSPENDED])
@@ -1576,7 +1570,7 @@ class API(BaseAPI):
                     instance,
                     vm_state=vm_states.SUSPENDED,
                     task_state=task_states.RESUMING)
-        self._cast_compute_message('resume_instance', context, instance)
+        self.compute_rpcapi.resume_instance(context, instance=instance)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
@@ -1589,11 +1583,8 @@ class API(BaseAPI):
                     vm_state=vm_states.ACTIVE,
                     task_state=task_states.RESCUING)
 
-        rescue_params = {
-            "rescue_password": rescue_password
-        }
-        self._cast_compute_message('rescue_instance', context, instance,
-                params=rescue_params)
+        self.compute_rpcapi.rescue_instance(context, instance=instance,
+                rescue_password=rescue_password)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.RESCUED])
@@ -1603,7 +1594,7 @@ class API(BaseAPI):
                     instance,
                     vm_state=vm_states.RESCUED,
                     task_state=task_states.UNRESCUING)
-        self._cast_compute_message('unrescue_instance', context, instance)
+        self.compute_rpcapi.unrescue_instance(context, instance=instance)
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE])
@@ -1613,50 +1604,42 @@ class API(BaseAPI):
                     instance,
                     task_state=task_states.UPDATING_PASSWORD)
 
-        params = {"new_pass": password}
-        self._cast_compute_message('set_admin_password', context, instance,
-                params=params)
+        self.compute_rpcapi.set_admin_password(context, instance=instance,
+                new_pass=password)
 
     @wrap_check_policy
     def inject_file(self, context, instance, path, file_contents):
         """Write a file to the given instance."""
-        params = {'path': path, 'file_contents': file_contents}
-        self._cast_compute_message('inject_file', context, instance,
-                params=params)
+        self.compute_rpcapi.inject_file(context, instance=instance, path=path,
+                file_contents=file_contents)
 
     @wrap_check_policy
     def get_vnc_console(self, context, instance, console_type):
         """Get a url to an instance Console."""
-        connect_info = self._call_compute_message('get_vnc_console',
-                context, instance, params={"console_type": console_type})
+        connect_info = self.compute_rpcapi.get_vnc_console(context,
+                instance=instance, console_type=console_type)
 
-        rpc.call(context, '%s' % FLAGS.consoleauth_topic,
-                 {'method': 'authorize_console',
-                  'args': {'token': connect_info['token'],
-                           'console_type': console_type,
-                           'host': connect_info['host'],
-                           'port': connect_info['port'],
-                           'internal_access_path':
-                                   connect_info['internal_access_path']}})
+        self.consoleauth_rpcapi.authorize_console(context,
+                connect_info['token'], console_type, connect_info['host'],
+                connect_info['port'], connect_info['internal_access_path'])
 
         return {'url': connect_info['access_url']}
 
     @wrap_check_policy
     def get_console_output(self, context, instance, tail_length=None):
         """Get console output for an an instance."""
-        params = {'tail_length': tail_length}
-        return self._call_compute_message('get_console_output', context,
-                instance, params=params)
+        return self.compute_rpcapi.get_console_output(context,
+                instance=instance, tail_length=tail_length)
 
     @wrap_check_policy
     def lock(self, context, instance):
         """Lock the given instance."""
-        self._cast_compute_message('lock_instance', context, instance)
+        self.compute_rpcapi.lock_instance(context, instance=instance)
 
     @wrap_check_policy
     def unlock(self, context, instance):
         """Unlock the given instance."""
-        self._cast_compute_message('unlock_instance', context, instance)
+        self.compute_rpcapi.unlock_instance(context, instance=instance)
 
     @wrap_check_policy
     def get_lock(self, context, instance):
@@ -1666,12 +1649,12 @@ class API(BaseAPI):
     @wrap_check_policy
     def reset_network(self, context, instance):
         """Reset networking on the instance."""
-        self._cast_compute_message('reset_network', context, instance)
+        self.compute_rpcapi.reset_network(context, instance=instance)
 
     @wrap_check_policy
     def inject_network_info(self, context, instance):
         """Inject network info for the instance."""
-        self._cast_compute_message('inject_network_info', context, instance)
+        self.compute_rpcapi.inject_network_info(context, instance=instance)
 
     @wrap_check_policy
     def attach_volume(self, context, instance, volume_id, device):
@@ -1681,10 +1664,8 @@ class API(BaseAPI):
         volume = self.volume_api.get(context, volume_id)
         self.volume_api.check_attach(context, volume)
         self.volume_api.reserve_volume(context, volume)
-        params = {"volume_id": volume_id,
-                  "mountpoint": device}
-        self._cast_compute_message('attach_volume', context, instance,
-                params=params)
+        self.compute_rpcapi.attach_volume(context, instance=instance,
+                volume_id=volume_id, mountpoint=device)
 
     # FIXME(comstud): I wonder if API should pull in the instance from
     # the volume ID via volume API and pass it and the volume object here
@@ -1702,9 +1683,8 @@ class API(BaseAPI):
         volume = self.volume_api.get(context, volume_id)
         self.volume_api.check_detach(context, volume)
 
-        params = {'volume_id': volume_id}
-        self._cast_compute_message('detach_volume', context, instance,
-                params=params)
+        self.compute_rpcapi.detach_volume(context, instance=instance,
+                volume_id=volume_id)
         return instance
 
     @wrap_check_policy
@@ -1792,32 +1772,38 @@ class API(BaseAPI):
                 instance['uuid'])
 
 
-class HostAPI(BaseAPI):
+class HostAPI(base.Base):
+    def __init__(self):
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
+        super(HostAPI, self).__init__()
+
     """Sub-set of the Compute Manager API for managing host operations."""
     def set_host_enabled(self, context, host, enabled):
         """Sets the specified host's ability to accept new instances."""
         # NOTE(comstud): No instance_uuid argument to this compute manager
         # call
-        return self._call_compute_message("set_host_enabled", context,
-                host=host, params={"enabled": enabled})
+        return self.compute_rpcapi.set_host_enabled(context, enabled=enabled,
+                host=host)
 
     def host_power_action(self, context, host, action):
         """Reboots, shuts down or powers up the host."""
         # NOTE(comstud): No instance_uuid argument to this compute manager
         # call
-        return self._call_compute_message("host_power_action", context,
-                host=host, params={"action": action})
+        topic = self.db.queue_get_for(context, FLAGS.compute_topic, host)
+        return self.compute_rpcapi.host_power_action(context, action=action,
+                host=host)
 
     def set_host_maintenance(self, context, host, mode):
         """Start/Stop host maintenance window. On start, it triggers
         guest VMs evacuation."""
-        return self._call_compute_message("host_maintenance_mode", context,
-                host=host, params={"host": host, "mode": mode})
+        return self.compute_rpcapi.host_maintenance_mode(context,
+                host_param=host, mode=mode, host=host)
 
 
 class AggregateAPI(base.Base):
     """Sub-set of the Compute Manager API for managing host aggregates."""
     def __init__(self, **kwargs):
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
         super(AggregateAPI, self).__init__(**kwargs)
 
     def create_aggregate(self, context, aggregate_name, availability_zone):
@@ -1897,10 +1883,8 @@ class AggregateAPI(base.Base):
             if aggregate.operational_state == aggregate_states.CREATED:
                 values = {'operational_state': aggregate_states.CHANGING}
                 self.db.aggregate_update(context, aggregate_id, values)
-            queue = self.db.queue_get_for(context, service.topic, host)
-            rpc.cast(context, queue, {"method": "add_aggregate_host",
-                                      "args": {"aggregate_id": aggregate_id,
-                                               "host": host}, })
+            self.compute_rpcapi.add_aggregate_host(context,
+                    aggregate_id=aggregate_id, host_param=host, host=host)
             return self.get_aggregate(context, aggregate_id)
         else:
             invalid = {aggregate_states.CHANGING: 'setup in progress',
@@ -1920,10 +1904,8 @@ class AggregateAPI(base.Base):
         if aggregate.operational_state in [aggregate_states.ACTIVE,
                                            aggregate_states.ERROR]:
             self.db.aggregate_host_delete(context, aggregate_id, host)
-            queue = self.db.queue_get_for(context, service.topic, host)
-            rpc.cast(context, queue, {"method": "remove_aggregate_host",
-                                      "args": {"aggregate_id": aggregate_id,
-                                               "host": host}, })
+            self.compute_rpcapi.remove_aggregate_host(context,
+                    aggregate_id=aggregate_id, host_param=host, host=host)
             return self.get_aggregate(context, aggregate_id)
         else:
             invalid = {aggregate_states.CREATED: 'no hosts to remove',
@@ -1973,7 +1955,10 @@ class KeypairAPI(base.Base):
         """Import a key pair using an existing public key."""
         self._validate_keypair_name(context, user_id, key_name)
 
-        if quota.allowed_key_pairs(context, 1) < 1:
+        count = QUOTAS.count(context, 'key_pairs', user_id)
+        try:
+            QUOTAS.limit_check(context, key_pairs=count + 1)
+        except exception.OverQuota:
             raise exception.KeypairLimitExceeded()
 
         try:
@@ -1994,7 +1979,10 @@ class KeypairAPI(base.Base):
         """Create a new key pair."""
         self._validate_keypair_name(context, user_id, key_name)
 
-        if quota.allowed_key_pairs(context, 1) < 1:
+        count = QUOTAS.count(context, 'key_pairs', user_id)
+        try:
+            QUOTAS.limit_check(context, key_pairs=count + 1)
+        except exception.OverQuota:
             raise exception.KeypairLimitExceeded()
 
         private_key, public_key, fingerprint = crypto.generate_key_pair()

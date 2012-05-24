@@ -39,8 +39,8 @@ from nova import flags
 import nova.image.fake
 import nova.rpc
 from nova import test
-from nova.tests import fake_network
 from nova.tests.api.openstack import fakes
+from nova.tests import fake_network
 from nova import utils
 
 
@@ -1287,6 +1287,7 @@ class ServersControllerTest(test.TestCase):
             self.assertEqual(s['name'], 'server%d' % (i + 1))
 
     def test_delete_server_instance(self):
+        fakes.stub_out_instance_quota(self.stubs, 0)
         req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
         req.method = 'DELETE'
 
@@ -1304,6 +1305,7 @@ class ServersControllerTest(test.TestCase):
         self.assertEqual(self.server_delete_called, True)
 
     def test_delete_server_instance_while_building(self):
+        fakes.stub_out_instance_quota(self.stubs, 0)
         req = fakes.HTTPRequest.blank('/v2/fake/servers/%s' % FAKE_UUID)
         req.method = 'DELETE'
 
@@ -1442,7 +1444,7 @@ class ServersControllerCreateTest(test.TestCase):
             """
             return self.instance_cache[instance_id]
 
-        def rpc_call_wrapper(context, topic, msg):
+        def rpc_call_wrapper(context, topic, msg, timeout=None):
             """Stub out the scheduler creating the instance entry"""
             if (topic == FLAGS.scheduler_topic and
                 msg['method'] == 'run_instance'):
@@ -2338,7 +2340,7 @@ class ServersControllerCreateTest(test.TestCase):
         req.headers["content-type"] = "application/json"
         try:
             server = self.controller.create(req, body).obj['server']
-            fail('excepted quota to be exceeded')
+            self.fail('expected quota to be exceeded')
         except webob.exc.HTTPRequestEntityTooLarge as e:
             self.assertEquals(e.explanation,
                       _('Quota exceeded: already used 1 of 1 instances'))

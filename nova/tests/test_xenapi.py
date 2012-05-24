@@ -39,15 +39,15 @@ from nova import log as logging
 from nova.openstack.common import importutils
 from nova import test
 from nova.tests.db import fakes as db_fakes
-from nova.tests.xenapi import stubs
-from nova.tests.glance import stubs as glance_stubs
 from nova.tests import fake_network
 from nova.tests import fake_utils
+from nova.tests.glance import stubs as glance_stubs
+from nova.tests.xenapi import stubs
 from nova.virt.xenapi import connection as xenapi_conn
 from nova.virt.xenapi import fake as xenapi_fake
-from nova.virt.xenapi import volume_utils
-from nova.virt.xenapi import vmops
 from nova.virt.xenapi import vm_utils
+from nova.virt.xenapi import vmops
+from nova.virt.xenapi import volume_utils
 
 LOG = logging.getLogger(__name__)
 
@@ -713,12 +713,25 @@ class XenAPIVMTestCase(test.TestCase):
     def test_rescue(self):
         instance = self._create_instance()
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        vm = vm_utils.VMHelper.lookup(session, instance.name)
-        vbd = xenapi_fake.create_vbd(vm, None)
+        vm_ref = vm_utils.VMHelper.lookup(session, instance.name)
+
+        xenapi_fake.create_vbd(vm_ref, "swap", userdevice=1)
+        xenapi_fake.create_vbd(vm_ref, "rootfs", userdevice=0)
+
         conn = xenapi_conn.get_connection(False)
         image_meta = {'id': glance_stubs.FakeGlance.IMAGE_VHD,
                       'disk_format': 'vhd'}
         conn.rescue(self.context, instance, [], image_meta)
+
+        vm = xenapi_fake.get_record('VM', vm_ref)
+        rescue_name = "%s-rescue" % vm["name_label"]
+        rescue_ref = vm_utils.VMHelper.lookup(session, rescue_name)
+        rescue_vm = xenapi_fake.get_record('VM', rescue_ref)
+
+        vdi_uuids = []
+        for vbd_uuid in rescue_vm["VBDs"]:
+            vdi_uuids.append(xenapi_fake.get_record('VBD', vbd_uuid)["VDI"])
+        self.assertTrue("swap" not in vdi_uuids)
 
     def test_unrescue(self):
         instance = self._create_instance()

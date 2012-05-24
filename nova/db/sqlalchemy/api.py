@@ -1070,7 +1070,7 @@ def fixed_ip_get_all(context, session=None):
 @require_context
 def fixed_ip_get_by_address(context, address, session=None):
     result = model_query(context, models.FixedIp, session=session,
-                         read_deleted="yes").\
+                         read_deleted=context.read_deleted).\
                      filter_by(address=address).\
                      first()
     if not result:
@@ -1546,6 +1546,12 @@ def _instance_get_all_query(context, project_only=False):
 @require_admin_context
 def instance_get_all_by_host(context, host):
     return _instance_get_all_query(context).filter_by(host=host).all()
+
+
+@require_admin_context
+def instance_get_all_by_host_and_not_type(context, host, type_id=None):
+    return _instance_get_all_query(context).filter_by(host=host).\
+                   filter(models.Instance.instance_type_id != type_id).all()
 
 
 @require_context
@@ -2543,6 +2549,10 @@ def quota_reserve(context, resources, quotas, deltas, expire,
                                                       session=session,
                                                       save=False)
                 refresh = True
+            elif usages[resource].in_use < 0:
+                # Negative in_use count indicates a desync, so try to
+                # heal from that...
+                refresh = True
             elif usages[resource].until_refresh is not None:
                 usages[resource].until_refresh -= 1
                 if usages[resource].until_refresh <= 0:
@@ -2607,7 +2617,7 @@ def quota_reserve(context, resources, quotas, deltas, expire,
         #            they're not invalidated by being over-quota.
 
         # Create the reservations
-        if not unders and not overs:
+        if not overs:
             reservations = []
             for resource, delta in deltas.items():
                 reservation = reservation_create(elevated,
@@ -2638,7 +2648,8 @@ def quota_reserve(context, resources, quotas, deltas, expire,
             usage_ref.save(session=session)
 
     if unders:
-        raise exception.InvalidQuotaValue(unders=sorted(unders))
+        LOG.warning(_("Change will make usage less than 0 for the following "
+                      "resources: %(unders)s") % locals())
     if overs:
         usages = dict((k, dict(in_use=v['in_use'], reserved=v['reserved']))
                       for k, v in usages.items())
