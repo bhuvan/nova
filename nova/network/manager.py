@@ -201,9 +201,7 @@ class RPCAllocateFixedIP(object):
                                  jsonutils.to_primitive(network)}})
             if host != self.host:
                 # need to call allocate_fixed_ip to correct network host
-                topic = self.db.queue_get_for(context,
-                                              FLAGS.network_topic,
-                                              host)
+                topic = rpc.queue_get_for(context, FLAGS.network_topic, host)
                 args = {}
                 args['instance_id'] = instance_id
                 args['network_id'] = network['id']
@@ -241,7 +239,7 @@ class RPCAllocateFixedIP(object):
             host = network['host']
         if host != self.host:
             # need to call deallocate_fixed_ip on correct network host
-            topic = self.db.queue_get_for(context, FLAGS.network_topic, host)
+            topic = rpc.queue_get_for(context, FLAGS.network_topic, host)
             args = {'address': address,
                     'host': host}
             rpc.cast(context, topic,
@@ -513,7 +511,7 @@ class FloatingIP(object):
         else:
             # send to correct host
             rpc.cast(context,
-                     self.db.queue_get_for(context, FLAGS.network_topic, host),
+                     rpc.queue_get_for(context, FLAGS.network_topic, host),
                      {'method': '_associate_floating_ip',
                       'args': {'floating_address': floating_address,
                                'fixed_address': fixed_address,
@@ -583,7 +581,7 @@ class FloatingIP(object):
         else:
             # send to correct host
             rpc.cast(context,
-                     self.db.queue_get_for(context, FLAGS.network_topic, host),
+                     rpc.queue_get_for(context, FLAGS.network_topic, host),
                      {'method': '_disassociate_floating_ip',
                       'args': {'address': address,
                                'interface': interface}})
@@ -1013,7 +1011,7 @@ class NetworkManager(manager.SchedulerDependentManager):
         nw_info = self.build_network_info_model(context, vifs, networks,
                                                          rxtx_factor, host)
         self.db.instance_info_cache_update(context, instance_uuid,
-                                          {'network_info': nw_info.as_cache()})
+                                          {'network_info': nw_info.json()})
         return nw_info
 
     def build_network_info_model(self, context, vifs, networks,
@@ -1177,8 +1175,11 @@ class NetworkManager(manager.SchedulerDependentManager):
     @wrap_check_policy
     def add_fixed_ip_to_instance(self, context, instance_id, host, network_id):
         """Adds a fixed ip to an instance from specified network."""
-        networks = [self._get_network_by_id(context, network_id)]
-        self._allocate_fixed_ips(context, instance_id, host, networks)
+        if utils.is_uuid_like(network_id):
+            network = self.get_network(context, network_id)
+        else:
+            network = self._get_network_by_id(context, network_id)
+        self._allocate_fixed_ips(context, instance_id, host, [network])
 
     @wrap_check_policy
     def remove_fixed_ip_from_instance(self, context, instance_id, host,
@@ -1542,8 +1543,7 @@ class NetworkManager(manager.SchedulerDependentManager):
                 call_func(context, network)
             else:
                 # i'm not the right host, run call on correct host
-                topic = self.db.queue_get_for(context, FLAGS.network_topic,
-                                              host)
+                topic = rpc.queue_get_for(context, FLAGS.network_topic, host)
                 args = {'network_id': network['id'], 'teardown': teardown}
                 # NOTE(tr3buchet): the call is just to wait for completion
                 green_pool.spawn_n(rpc.call, context, topic,

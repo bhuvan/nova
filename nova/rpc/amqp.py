@@ -26,6 +26,7 @@ AMQP, but is deprecated and predates this code.
 """
 
 import inspect
+import logging
 import sys
 import uuid
 
@@ -33,8 +34,6 @@ from eventlet import greenpool
 from eventlet import pools
 from eventlet import semaphore
 
-from nova import context
-from nova import log as logging
 from nova.openstack.common import excutils
 from nova.openstack.common import local
 import nova.rpc.common as rpc_common
@@ -75,13 +74,14 @@ def get_connection_pool(conf, connection_cls):
 
 class ConnectionContext(rpc_common.Connection):
     """The class that is actually returned to the caller of
-    create_connection().  This is a essentially a wrapper around
-    Connection that supports 'with' and can return a new Connection or
-    one from a pool.  It will also catch when an instance of this class
-    is to be deleted so that we can return Connections to the pool on
-    exceptions and so forth without making the caller be responsible for
-    catching all exceptions and making sure to return a connection to
-    the pool.
+    create_connection().  This is essentially a wrapper around
+    Connection that supports 'with'.  It can also return a new
+    Connection, or one from a pool.  The function will also catch
+    when an instance of this class is to be deleted.  With that
+    we can return Connections to the pool on exceptions and so
+    forth without making the caller be responsible for catching
+    them.  If possible the function makes sure to return a
+    connection to the pool.
     """
 
     def __init__(self, conf, connection_pool, pooled=True, server_params=None):
@@ -132,6 +132,9 @@ class ConnectionContext(rpc_common.Connection):
     def create_consumer(self, topic, proxy, fanout=False):
         self.connection.create_consumer(topic, proxy, fanout)
 
+    def create_worker(self, topic, proxy, pool_name):
+        self.connection.create_worker(topic, proxy, pool_name)
+
     def consume_in_thread(self):
         self.connection.consume_in_thread()
 
@@ -165,12 +168,18 @@ def msg_reply(conf, msg_id, connection_pool, reply=None, failure=None,
         conn.direct_send(msg_id, msg)
 
 
-class RpcContext(context.RequestContext):
+class RpcContext(rpc_common.CommonRpcContext):
     """Context that supports replying to a rpc.call"""
-    def __init__(self, *args, **kwargs):
+    def __init__(self, **kwargs):
         self.msg_id = kwargs.pop('msg_id', None)
         self.conf = kwargs.pop('conf')
-        super(RpcContext, self).__init__(*args, **kwargs)
+        super(RpcContext, self).__init__(**kwargs)
+
+    def deepcopy(self):
+        values = self.to_dict()
+        values['conf'] = self.conf
+        values['msg_id'] = self.msg_id
+        return self.__class__(**values)
 
     def reply(self, reply=None, failure=None, ending=False,
               connection_pool=None):

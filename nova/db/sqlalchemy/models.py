@@ -247,7 +247,7 @@ class Instance(BASE, NovaBase):
     display_name = Column(String(255))
     display_description = Column(String(255))
 
-    # To remember on which host a instance booted.
+    # To remember on which host an instance booted.
     # An instance may have moved to another host by live migraiton.
     launched_on = Column(Text)
     locked = Column(Boolean)
@@ -342,7 +342,7 @@ class Volume(BASE, NovaBase):
     availability_zone = Column(String(255))  # TODO(vish): foreign key?
     instance_uuid = Column(String(36))
     mountpoint = Column(String(255))
-    attach_time = Column(String(255))  # TODO(vish): datetime
+    attach_time = Column(DateTime)
     status = Column(String(255))  # TODO(vish): enum?
     attach_status = Column(String(255))  # TODO(vish): enum
 
@@ -465,9 +465,11 @@ class Reservation(BASE, NovaBase):
     uuid = Column(String(36), nullable=False)
 
     usage_id = Column(Integer, ForeignKey('quota_usages.id'), nullable=False)
+    # NOTE(dprince): Force innerjoin below for lockmode update on PostgreSQL
     usage = relationship(QuotaUsage,
                          backref=backref('reservations'),
                          foreign_keys=usage_id,
+                         innerjoin=True,
                          primaryjoin='and_('
                               'Reservation.usage_id == QuotaUsage.id,'
                               'Reservation.deleted == False)')
@@ -716,7 +718,7 @@ class FixedIp(BASE, NovaBase):
     virtual_interface_id = Column(Integer, nullable=True)
     instance_id = Column(Integer, nullable=True)
     # associated means that a fixed_ip has its instance_id column set
-    # allocated means that a fixed_ip has a its virtual_interface_id column set
+    # allocated means that a fixed_ip has its virtual_interface_id column set
     allocated = Column(Boolean, default=False)
     # leased means dhcp bridge has leased the ip
     leased = Column(Boolean, default=False)
@@ -1049,51 +1051,3 @@ class InstanceFault(BASE, NovaBase):
     code = Column(Integer(), nullable=False)
     message = Column(String(255))
     details = Column(Text)
-
-
-def register_models():
-    """Register Models and create metadata.
-
-    Called from nova.db.sqlalchemy.__init__ as part of loading the driver,
-    it will never need to be called explicitly elsewhere unless the
-    connection is lost and needs to be reestablished.
-    """
-    from sqlalchemy import create_engine
-    models = (AgentBuild,
-              Aggregate,
-              AggregateHost,
-              AggregateMetadata,
-              AuthToken,
-              Certificate,
-              Cell,
-              Console,
-              ConsolePool,
-              FixedIp,
-              FloatingIp,
-              Instance,
-              InstanceFault,
-              InstanceMetadata,
-              InstanceTypeExtraSpecs,
-              InstanceTypes,
-              IscsiTarget,
-              Migration,
-              Network,
-              Project,
-              SecurityGroup,
-              SecurityGroupIngressRule,
-              SecurityGroupInstanceAssociation,
-              Service,
-              SMBackendConf,
-              SMFlavors,
-              SMVolume,
-              User,
-              Volume,
-              VolumeMetadata,
-              VolumeTypeExtraSpecs,
-              VolumeTypes,
-              VolumeIdMapping,
-              SnapshotIdMapping,
-              )
-    engine = create_engine(FLAGS.sql_connection, echo=False)
-    for model in models:
-        model.metadata.create_all(engine)

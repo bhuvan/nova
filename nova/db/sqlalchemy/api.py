@@ -19,6 +19,7 @@
 
 """Implementation of SQLAlchemy backend."""
 
+import copy
 import datetime
 import functools
 import re
@@ -1591,8 +1592,7 @@ def instance_get_floating_address(context, instance_id):
 
 @require_admin_context
 def instance_get_all_hung_in_rebooting(context, reboot_window, session=None):
-    reboot_window = datetime.datetime.utcnow() - datetime.timedelta(
-            seconds=reboot_window)
+    reboot_window = utils.utcnow() - datetime.timedelta(seconds=reboot_window)
 
     if not session:
         session = get_session()
@@ -1640,6 +1640,30 @@ def instance_test_and_set(context, instance_id, attr, ok_states,
 
 @require_context
 def instance_update(context, instance_id, values):
+
+    instance_ref = _instance_update(context, instance_id, values)[1]
+    return instance_ref
+
+
+@require_context
+def instance_update_and_get_original(context, instance_id, values):
+    """Set the given properties on an instance and update it. Return
+    a shallow copy of the original instance reference, as well as the
+    updated one.
+
+    :param context: = request context object
+    :param instance_id: = instance id or uuid
+    :param values: = dict containing column values
+
+    :returns: a tuple of the form (old_instance_ref, new_instance_ref)
+
+    Raises NotFound if instance does not exist.
+    """
+    return _instance_update(context, instance_id, values,
+            copy_old_instance=True)
+
+
+def _instance_update(context, instance_id, values, copy_old_instance=False):
     session = get_session()
 
     if utils.is_uuid_like(instance_id):
@@ -1647,6 +1671,11 @@ def instance_update(context, instance_id, values):
                                             session=session)
     else:
         instance_ref = instance_get(context, instance_id, session=session)
+
+    if copy_old_instance:
+        old_instance_ref = copy.copy(instance_ref)
+    else:
+        old_instance_ref = None
 
     metadata = values.get('metadata')
     if metadata is not None:
@@ -1663,7 +1692,7 @@ def instance_update(context, instance_id, values):
         instance_ref.update(values)
         instance_ref.save(session=session)
 
-    return instance_ref
+    return (old_instance_ref, instance_ref)
 
 
 def instance_add_security_group(context, instance_uuid, security_group_id):
@@ -1965,7 +1994,7 @@ def network_get(context, network_id, session=None):
     return result
 
 
-@require_admin_context
+@require_context
 def network_get_all(context):
     result = model_query(context, models.Network, read_deleted="no").all()
 
@@ -2169,14 +2198,6 @@ def network_update(context, network_id, values):
         network_ref.update(values)
         network_ref.save(session=session)
         return network_ref
-
-
-###################
-
-
-def queue_get_for(context, topic, physical_node_id):
-    # FIXME(ja): this should be servername?
-    return "%s.%s" % (topic, physical_node_id)
 
 
 ###################
@@ -2781,6 +2802,7 @@ def volume_attached(context, volume_id, instance_uuid, mountpoint):
         volume_ref['mountpoint'] = mountpoint
         volume_ref['attach_status'] = 'attached'
         volume_ref['instance_uuid'] = instance_uuid
+        volume_ref['attach_time'] = utils.utcnow()
         volume_ref.save(session=session)
 
 
@@ -2819,6 +2841,7 @@ def volume_data_get_for_project(context, project_id, session=None):
 def volume_destroy(context, volume_id):
     session = get_session()
     with session.begin():
+        volume_ref = volume_get(context, volume_id, session=session)
         session.query(models.Volume).\
                 filter_by(id=volume_id).\
                 update({'deleted': True,
@@ -2832,6 +2855,7 @@ def volume_destroy(context, volume_id):
                 update({'deleted': True,
                         'deleted_at': utils.utcnow(),
                         'updated_at': literal_column('updated_at')})
+    return volume_ref
 
 
 @require_admin_context
@@ -2923,6 +2947,7 @@ def volume_get_iscsi_target_num(context, volume_id):
 @require_context
 def volume_update(context, volume_id, values):
     session = get_session()
+    volume_ref = volume_get(context, volume_id, session=session)
     metadata = values.get('metadata')
     if metadata is not None:
         volume_metadata_update(context,
@@ -2930,9 +2955,10 @@ def volume_update(context, volume_id, values):
                                 values.pop('metadata'),
                                 delete=True)
     with session.begin():
-        volume_ref = volume_get(context, volume_id, session=session)
         volume_ref.update(values)
         volume_ref.save(session=session)
+
+    return volume_ref
 
 
 @require_context
@@ -3745,8 +3771,8 @@ def migration_get_by_instance_and_status(context, instance_uuid, status):
 
 @require_admin_context
 def migration_get_all_unconfirmed(context, confirm_window, session=None):
-    confirm_window = datetime.datetime.utcnow() - datetime.timedelta(
-            seconds=confirm_window)
+    confirm_window = (utils.utcnow() -
+                      datetime.timedelta(seconds=confirm_window))
 
     return model_query(context, models.Migration, session=session,
                        read_deleted="yes").\

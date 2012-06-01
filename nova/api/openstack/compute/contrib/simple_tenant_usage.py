@@ -152,7 +152,7 @@ class SimpleTenantUsageController(object):
             else:
                 info['state'] = instance['vm_state']
 
-            now = datetime.datetime.utcnow()
+            now = utils.utcnow()
 
             if info['state'] == 'terminated':
                 delta = info['ended_at'] - info['started_at']
@@ -202,10 +202,11 @@ class SimpleTenantUsageController(object):
     def _get_datetime_range(self, req):
         qs = req.environ.get('QUERY_STRING', '')
         env = urlparse.parse_qs(qs)
+        # NOTE(lzyeval): env.get() always returns a list
         period_start = self._parse_datetime(env.get('start', [None])[0])
         period_stop = self._parse_datetime(env.get('end', [None])[0])
 
-        detailed = bool(env.get('detailed', False))
+        detailed = env.get('detailed', ['0'])[0] == '1'
         return (period_start, period_stop, detailed)
 
     @wsgi.serializers(xml=SimpleTenantUsagesTemplate)

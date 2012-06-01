@@ -96,7 +96,7 @@ class DbApiTestCase(test.TestCase):
         db.migration_update(ctxt, migration.id, {"status": "CONFIRMED"})
 
         # Ensure the new migration is not returned.
-        updated_at = datetime.datetime.utcnow()
+        updated_at = utils.utcnow()
         values = {"status": "finished", "updated_at": updated_at}
         migration = db.migration_create(ctxt, values)
         results = db.migration_get_all_unconfirmed(ctxt, 10)
@@ -120,7 +120,7 @@ class DbApiTestCase(test.TestCase):
         db.instance_update(ctxt, instance.id, {"task_state": None})
 
         # Ensure the newly rebooted instance is not returned.
-        updated_at = datetime.datetime.utcnow()
+        updated_at = utils.utcnow()
         values = {"task_state": "rebooting", "updated_at": updated_at}
         instance = db.instance_create(ctxt, values)
         results = db.instance_get_all_hung_in_rebooting(ctxt, 10)
@@ -210,6 +210,18 @@ class DbApiTestCase(test.TestCase):
         # Retrieve the system metadata to ensure it was successfully updated
         system_meta = db.instance_system_metadata_get(ctxt, instance.uuid)
         self.assertEqual('baz', system_meta['original_image_ref'])
+
+    def test_instance_update_with_and_get_original(self):
+        ctxt = context.get_admin_context()
+
+        # Create an instance with some metadata
+        values = {'vm_state': 'building'}
+        instance = db.instance_create(ctxt, values)
+
+        (old_ref, new_ref) = db.instance_update_and_get_original(ctxt,
+                instance['id'], {'vm_state': 'needscoffee'})
+        self.assertEquals("building", old_ref["vm_state"])
+        self.assertEquals("needscoffee", new_ref["vm_state"])
 
     def test_instance_fault_create(self):
         """Ensure we can create an instance fault"""

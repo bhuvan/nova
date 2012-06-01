@@ -18,16 +18,16 @@
 Client side of the compute RPC API.
 """
 
-from nova.db import base
 from nova import exception
 from nova import flags
+from nova import rpc
 import nova.rpc.proxy
 
 
 FLAGS = flags.FLAGS
 
 
-class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
+class ComputeAPI(nova.rpc.proxy.RpcProxy):
     '''Client side of the compute rpc API.
 
     API version history:
@@ -58,7 +58,7 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
         if not host:
             raise exception.NovaException(_('Unable to find host for '
                                             'Instance %s') % instance['uuid'])
-        return self.db.queue_get_for(ctxt, self.topic, host)
+        return rpc.queue_get_for(ctxt, self.topic, host)
 
     def add_aggregate_host(self, ctxt, aggregate_id, host_param, host):
         '''Add aggregate host.
@@ -84,6 +84,10 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
                 mountpoint=mountpoint),
                 topic=self._compute_topic(ctxt, None, instance))
 
+    def compare_cpu(self, ctxt, cpu_info, host):
+        return self.call(ctxt, self.make_msg('compare_cpu', cpu_info=cpu_info),
+                topic=self._compute_topic(ctxt, host, None))
+
     def confirm_resize(self, ctxt, instance, migration_id, host,
             cast=True):
         rpc_method = self.cast if cast else self.call
@@ -96,10 +100,31 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
                 instance_uuid=instance['uuid'], volume_id=volume_id),
                 topic=self._compute_topic(ctxt, None, instance))
 
+    def finish_resize(self, ctxt, instance, migration_id, image, disk_info,
+            host):
+        self.cast(ctxt, self.make_msg('finish_resize',
+                instance_uuid=instance['uuid'], migration_id=migration_id,
+                image=image, disk_info=disk_info),
+                topic=self._compute_topic(ctxt, host, None))
+
+    def finish_revert_resize(self, ctxt, instance, migration_id, host):
+        self.cast(ctxt, self.make_msg('finish_revert_resize',
+                instance_uuid=instance['uuid'], migration_id=migration_id),
+                topic=self._compute_topic(ctxt, host, None))
+
     def get_console_output(self, ctxt, instance, tail_length):
         return self.call(ctxt, self.make_msg('get_console_output',
                 instance_uuid=instance['uuid'], tail_length=tail_length),
                 topic=self._compute_topic(ctxt, None, instance))
+
+    def get_console_pool_info(self, ctxt, console_type, host):
+        return self.call(ctxt, self.make_msg('get_console_pool_info',
+                console_type=console_type),
+                topic=self._compute_topic(ctxt, host, None))
+
+    def get_console_topic(self, ctxt, host):
+        return self.call(ctxt, self.make_msg('get_console_topic'),
+                topic=self._compute_topic(ctxt, host, None))
 
     def get_diagnostics(self, ctxt, instance):
         return self.call(ctxt, self.make_msg('get_diagnostics',
@@ -144,6 +169,13 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
                 instance_uuid=instance['uuid']),
                 topic=self._compute_topic(ctxt, None, instance))
 
+    def post_live_migration_at_destination(self, ctxt, instance,
+            block_migration, host):
+        return self.call(ctxt,
+                self.make_msg('post_live_migration_at_destination',
+                instance_id=instance['id'], block_migration=block_migration),
+                self._compute_topic(ctxt, host, None))
+
     def pause_instance(self, ctxt, instance):
         self.cast(ctxt, self.make_msg('pause_instance',
                 instance_uuid=instance['uuid']),
@@ -159,6 +191,12 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
                 instance_uuid=instance['uuid']),
                 topic=self._compute_topic(ctxt, None, instance))
 
+    def pre_live_migration(self, ctxt, instance, block_migration, disk,
+            host):
+        return self.call(ctxt, self.make_msg('pre_live_migration',
+                instance_id=instance['id'], block_migration=block_migration,
+                disk=disk), self._compute_topic(ctxt, host, None))
+
     def reboot_instance(self, ctxt, instance, reboot_type):
         self.cast(ctxt, self.make_msg('reboot_instance',
                 instance_uuid=instance['uuid'], reboot_type=reboot_type),
@@ -171,6 +209,10 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
                 injected_files=injected_files, image_ref=image_ref,
                 orig_image_ref=orig_image_ref),
                 topic=self._compute_topic(ctxt, None, instance))
+
+    def refresh_provider_fw_rules(self, ctxt, host):
+        self.cast(ctxt, self.make_msg('refresh_provider_fw_rules'),
+                self._compute_topic(ctxt, host, None))
 
     def refresh_security_group_rules(self, ctxt, security_group_id, host):
         self.cast(ctxt, self.make_msg('refresh_security_group_rules',
@@ -212,6 +254,11 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
                 instance_uuid=instance['uuid']),
                 topic=self._compute_topic(ctxt, None, instance))
 
+    def resize_instance(self, ctxt, instance, migration_id, image):
+        self.cast(ctxt, self.make_msg('resize_instance',
+                instance_uuid=instance['uuid'], migration_id=migration_id,
+                image=image), topic=self._compute_topic(ctxt, None, instance))
+
     def resume_instance(self, ctxt, instance):
         self.cast(ctxt, self.make_msg('resume_instance',
                 instance_uuid=instance['uuid']),
@@ -221,6 +268,11 @@ class ComputeAPI(nova.rpc.proxy.RpcProxy, base.Base):
         self.cast(ctxt, self.make_msg('revert_resize',
                 instance_uuid=instance['uuid'], migration_id=migration_id),
                 topic=self._compute_topic(ctxt, host, instance))
+
+    def rollback_live_migration_at_destination(self, ctxt, instance, host):
+        self.cast(ctxt, self.make_msg('rollback_live_migration_at_destination',
+            instance_id=instance['id']),
+            topic=self._compute_topic(ctxt, host, None))
 
     def set_admin_password(self, ctxt, instance, new_pass):
         self.cast(ctxt, self.make_msg('set_admin_password',

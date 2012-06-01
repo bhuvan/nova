@@ -32,11 +32,14 @@ from nova.api import ec2
 from nova.api.ec2 import apirequest
 from nova.api.ec2 import ec2utils
 from nova import block_device
-from nova.compute import api as compute_api
 from nova import context
 from nova import exception
+from nova import flags
 from nova import test
 from nova import utils
+
+
+FLAGS = flags.FLAGS
 
 
 class FakeHttplibSocket(object):
@@ -214,9 +217,9 @@ class ApiEc2TestCase(test.TestCase):
         # NOTE(vish): skipping the Authorizer
         roles = ['sysadmin', 'netadmin']
         ctxt = context.RequestContext('fake', 'fake', roles=roles)
-        self.app = auth.InjectContext(ctxt,
-                ec2.Requestify(ec2.Authorizer(ec2.Executor()),
-                               'nova.api.ec2.cloud.CloudController'))
+        self.app = auth.InjectContext(ctxt, ec2.FaultWrapper(
+                ec2.RequestLogging(ec2.Requestify(ec2.Authorizer(ec2.Executor()
+                               ), 'nova.api.ec2.cloud.CloudController'))))
 
     def expect_http(self, host=None, is_secure=False, api_version=None):
         """Returns a new EC2 connection"""
@@ -345,19 +348,37 @@ class ApiEc2TestCase(test.TestCase):
 
     def test_group_name_valid_chars_security_group(self):
         """ Test that we sanely handle invalid security group names.
-         API Spec states we should only accept alphanumeric characters,
-         spaces, dashes, and underscores. """
-        self.expect_http()
-        self.mox.ReplayAll()
+         EC2 API Spec states we should only accept alphanumeric characters,
+         spaces, dashes, and underscores. Amazon implementation
+         accepts more characters - so, [:print:] is ok. """
 
-        # Test block group_name of non alphanumeric characters, spaces,
-        # dashes, and underscores.
-        security_group_name = "aa #^% -=99"
-
-        self.assertRaises(boto_exc.EC2ResponseError,
-                self.ec2.create_security_group,
-                security_group_name,
-                'test group')
+        bad_strict_ec2 = "aa \t\x01\x02\x7f"
+        bad_amazon_ec2 = "aa #^% -=99"
+        test_raise = [
+            (True, bad_amazon_ec2, "test desc"),
+            (True, "test name", bad_amazon_ec2),
+            (False, bad_strict_ec2, "test desc"),
+        ]
+        for test in test_raise:
+            self.expect_http()
+            self.mox.ReplayAll()
+            FLAGS.ec2_strict_validation = test[0]
+            self.assertRaises(boto_exc.EC2ResponseError,
+                              self.ec2.create_security_group,
+                              test[1],
+                              test[2])
+        test_accept = [
+            (False, bad_amazon_ec2, "test desc"),
+            (False, "test name", bad_amazon_ec2),
+        ]
+        for test in test_accept:
+            self.expect_http()
+            self.mox.ReplayAll()
+            FLAGS.ec2_strict_validation = test[0]
+            self.ec2.create_security_group(test[1], test[2])
+            self.expect_http()
+            self.mox.ReplayAll()
+            self.ec2.delete_security_group(test[1])
 
     def test_group_name_valid_length_security_group(self):
         """Test that we sanely handle invalid security group names.

@@ -370,12 +370,12 @@ class LibvirtConnection(driver.ComputeDriver):
     def plug_vifs(self, instance, network_info):
         """Plug VIFs into networks."""
         for (network, mapping) in network_info:
-            self.vif_driver.plug(instance, network, mapping)
+            self.vif_driver.plug(instance, (network, mapping))
 
     def unplug_vifs(self, instance, network_info):
         """Unplug VIFs from networks."""
         for (network, mapping) in network_info:
-            self.vif_driver.unplug(instance, network, mapping)
+            self.vif_driver.unplug(instance, (network, mapping))
 
     def _destroy(self, instance, network_info, block_device_info=None,
                  cleanup=True):
@@ -1626,7 +1626,7 @@ class LibvirtConnection(driver.ComputeDriver):
                 guest.add_device(diskconfig)
 
         for (network, mapping) in network_info:
-            cfg = self.vif_driver.plug(instance, network, mapping)
+            cfg = self.vif_driver.plug(instance, (network, mapping))
             guest.add_device(cfg)
 
         if FLAGS.libvirt_type == "qemu" or FLAGS.libvirt_type == "kvm":
@@ -1760,8 +1760,8 @@ class LibvirtConnection(driver.ComputeDriver):
             return []
 
         return filter(bool,
-                      [target.get("dev") \
-                           for target in doc.findall('devices/disk/target')])
+                      [target.get("dev")
+                       for target in doc.findall('devices/disk/target')])
 
     def get_interfaces(self, instance_name):
         """
@@ -1900,7 +1900,7 @@ class LibvirtConnection(driver.ComputeDriver):
         else:
             avail = (int(m[idx1 + 1]) + int(m[idx2 + 1]) + int(m[idx3 + 1]))
             # Convert it to MB
-            return  self.get_memory_mb_total() - avail / 1024
+            return self.get_memory_mb_total() - avail / 1024
 
     def get_local_gb_used(self):
         """Get the free hdd size(GB) of physical computer.
@@ -2021,9 +2021,9 @@ class LibvirtConnection(driver.ComputeDriver):
         #TODO(mdragon): console proxy should be implemented for libvirt,
         #               in case someone wants to use it with kvm or
         #               such. For now return fake data.
-        return  {'address': '127.0.0.1',
-                 'username': 'fakeuser',
-                 'password': 'fakepassword'}
+        return {'address': '127.0.0.1',
+                'username': 'fakeuser',
+                'password': 'fakepassword'}
 
     def refresh_security_group_rules(self, security_group_id):
         self.firewall_driver.refresh_security_group_rules(security_group_id)
@@ -2037,7 +2037,7 @@ class LibvirtConnection(driver.ComputeDriver):
     def update_available_resource(self, ctxt, host):
         """Updates compute manager resource info on ComputeNode table.
 
-        This method is called as an periodic tasks and is used only
+        This method is called as a periodic task and is used only
         in live migration currently.
 
         :param ctxt: security context

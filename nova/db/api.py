@@ -141,7 +141,7 @@ def service_get_all_volume_sorted(context):
 
 
 def service_get_by_args(context, host, binary):
-    """Get the state of an service by node name and binary."""
+    """Get the state of a service by node name and binary."""
     return IMPL.service_get_by_args(context, host, binary)
 
 
@@ -151,7 +151,7 @@ def service_create(context, values):
 
 
 def service_update(context, service_id, values):
-    """Set the given properties on an service and update it.
+    """Set the given properties on a service and update it.
 
     Raises NotFound if service does not exist.
 
@@ -163,7 +163,7 @@ def service_update(context, service_id, values):
 
 
 def compute_node_get(context, compute_id):
-    """Get an computeNode or raise if it does not exist."""
+    """Get a computeNode or raise if it does not exist."""
     return IMPL.compute_node_get(context, compute_id)
 
 
@@ -178,7 +178,7 @@ def compute_node_create(context, values):
 
 
 def compute_node_update(context, compute_id, values, auto_adjust=True):
-    """Set the given properties on an computeNode and update it.
+    """Set the given properties on a computeNode and update it.
 
     Raises NotFound if computeNode does not exist.
     """
@@ -258,7 +258,7 @@ def floating_ip_count_by_project(context, project_id, session=None):
 
 
 def floating_ip_deallocate(context, address):
-    """Deallocate an floating ip by address."""
+    """Deallocate a floating ip by address."""
     return IMPL.floating_ip_deallocate(context, address)
 
 
@@ -268,7 +268,7 @@ def floating_ip_destroy(context, address):
 
 
 def floating_ip_disassociate(context, address):
-    """Disassociate an floating ip from a fixed ip by address.
+    """Disassociate a floating ip from a fixed ip by address.
 
     :returns: the address of the existing fixed ip.
 
@@ -278,7 +278,7 @@ def floating_ip_disassociate(context, address):
 
 def floating_ip_fixed_ip_associate(context, floating_address,
                                    fixed_address, host):
-    """Associate an floating ip to a fixed_ip by address."""
+    """Associate a floating ip to a fixed_ip by address."""
     return IMPL.floating_ip_fixed_ip_associate(context,
                                                floating_address,
                                                fixed_address,
@@ -618,6 +618,22 @@ def instance_update(context, instance_id, values):
     return IMPL.instance_update(context, instance_id, values)
 
 
+def instance_update_and_get_original(context, instance_id, values):
+    """Set the given properties on an instance and update it. Return
+    a shallow copy of the original instance reference, as well as the
+    updated one.
+
+    :param context: = request context object
+    :param instance_id: = instance id or uuid
+    :param values: = dict containing column values
+
+    :returns: a tuple of the form (old_instance_ref, new_instance_ref)
+
+    Raises NotFound if instance does not exist.
+    """
+    return IMPL.instance_update_and_get_original(context, instance_id, values)
+
+
 def instance_add_security_group(context, instance_id, security_group_id):
     """Associate the given security group with the given instance."""
     return IMPL.instance_add_security_group(context, instance_id,
@@ -753,7 +769,7 @@ def network_disassociate(context, network_id):
 
 
 def network_get(context, network_id):
-    """Get an network or raise if it does not exist."""
+    """Get a network or raise if it does not exist."""
     return IMPL.network_get(context, network_id)
 
 
@@ -821,20 +837,12 @@ def network_set_host(context, network_id, host_id):
 
 
 def network_update(context, network_id, values):
-    """Set the given properties on an network and update it.
+    """Set the given properties on a network and update it.
 
     Raises NotFound if network does not exist.
 
     """
     return IMPL.network_update(context, network_id, values)
-
-
-###################
-
-
-def queue_get_for(context, topic, physical_node_id):
-    """Return a channel to send a message to a node with a topic."""
-    return IMPL.queue_get_for(context, topic, physical_node_id)
 
 
 ###################
@@ -1077,7 +1085,7 @@ def volume_get_all_by_host(context, host):
 
 
 def volume_get_all_by_instance_uuid(context, instance_uuid):
-    """Get all volumes belonging to a instance."""
+    """Get all volumes belonging to an instance."""
     return IMPL.volume_get_all_by_instance_uuid(context, instance_uuid)
 
 
@@ -1097,7 +1105,7 @@ def volume_get_iscsi_target_num(context, volume_id):
 
 
 def volume_update(context, volume_id, values):
-    """Set the given properties on an volume and update it.
+    """Set the given properties on a volume and update it.
 
     Raises NotFound if volume does not exist.
 
@@ -1158,7 +1166,7 @@ def snapshot_get_all_for_volume(context, volume_id):
 
 
 def snapshot_update(context, snapshot_id, values):
-    """Set the given properties on an snapshot and update it.
+    """Set the given properties on a snapshot and update it.
 
     Raises NotFound if snapshot does not exist.
 
@@ -1186,7 +1194,7 @@ def block_device_mapping_update_or_create(context, values):
 
 
 def block_device_mapping_get_all_by_instance(context, instance_uuid):
-    """Get all block device mapping belonging to a instance"""
+    """Get all block device mapping belonging to an instance"""
     return IMPL.block_device_mapping_get_all_by_instance(context,
                                                          instance_uuid)
 
@@ -1266,7 +1274,7 @@ def security_group_rule_create(context, values):
 
 
 def security_group_rule_get_by_security_group(context, security_group_id):
-    """Get all rules for a a given security group."""
+    """Get all rules for a given security group."""
     return IMPL.security_group_rule_get_by_security_group(context,
                                                           security_group_id)
 
@@ -1516,7 +1524,7 @@ def instance_type_get_by_flavor_id(context, id):
 
 
 def instance_type_destroy(context, name):
-    """Delete a instance type."""
+    """Delete an instance type."""
     return IMPL.instance_type_destroy(context, name)
 
 

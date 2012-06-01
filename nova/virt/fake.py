@@ -119,9 +119,6 @@ class FakeConnection(driver.ComputeDriver):
     def get_host_ip_addr():
         return '192.168.0.1'
 
-    def resize(self, instance, flavor):
-        pass
-
     def set_admin_password(self, instance, new_pass):
         pass
 
@@ -204,12 +201,6 @@ class FakeConnection(driver.ComputeDriver):
         bwusage = []
         return bwusage
 
-    def list_disks(self, instance_name):
-        return ['A_DISK']
-
-    def list_interfaces(self, instance_name):
-        return ['A_VIF']
-
     def block_stats(self, instance_name, disk_id):
         return [0L, 0L, 0L, 0L, None]
 
@@ -225,9 +216,9 @@ class FakeConnection(driver.ComputeDriver):
                 'port': 6969}
 
     def get_console_pool_info(self, console_type):
-        return  {'address': '127.0.0.1',
-                 'username': 'fakeuser',
-                 'password': 'fakepassword'}
+        return {'address': '127.0.0.1',
+                'username': 'fakeuser',
+                'password': 'fakepassword'}
 
     def refresh_security_group_rules(self, security_group_id):
         return True

@@ -154,6 +154,7 @@ class BaseTestCase(test.TestCase):
         inst['vcpus'] = 0
         inst['root_gb'] = 0
         inst['ephemeral_gb'] = 0
+        inst['architecture'] = 'x86_64'
         inst.update(params)
         return db.instance_create(self.context, inst)
 
@@ -1425,7 +1426,7 @@ class ComputeTestCase(BaseTestCase):
         inst_ref = self._create_fake_instance({'host': 'dummy'})
 
         c = context.get_admin_context()
-        topic = db.queue_get_for(c, FLAGS.compute_topic, inst_ref['host'])
+        topic = rpc.queue_get_for(c, FLAGS.compute_topic, inst_ref['host'])
 
         # creating volume testdata
         volume_id = db.volume_create(c, {'size': 1})['id']
@@ -1446,8 +1447,9 @@ class ComputeTestCase(BaseTestCase):
                  {"method": "pre_live_migration",
                   "args": {'instance_id': inst_ref['id'],
                            'block_migration': True,
-                           'disk': None}
-                 }).AndRaise(rpc.common.RemoteError('', '', ''))
+                           'disk': None},
+                  "version": compute_rpcapi.ComputeAPI.RPC_API_VERSION
+                 }, None).AndRaise(rpc.common.RemoteError('', '', ''))
 
         # mocks for rollback
         rpc.call(c, 'network', {'method': 'setup_networks_on_host',
@@ -1480,14 +1482,16 @@ class ComputeTestCase(BaseTestCase):
         instance_id = instance['id']
         c = context.get_admin_context()
         inst_ref = db.instance_get(c, instance_id)
-        topic = db.queue_get_for(c, FLAGS.compute_topic, inst_ref['host'])
+        topic = rpc.queue_get_for(c, FLAGS.compute_topic, inst_ref['host'])
 
         # create
         self.mox.StubOutWithMock(rpc, 'call')
-        rpc.call(c, topic, {"method": "pre_live_migration",
-                            "args": {'instance_id': instance_id,
-                                     'block_migration': False,
-                                     'disk': None}})
+        rpc.call(c, topic,
+                {"method": "pre_live_migration",
+                 "args": {'instance_id': instance_id,
+                          'block_migration': False,
+                          'disk': None},
+                 "version": compute_rpcapi.ComputeAPI.RPC_API_VERSION}, None)
 
         # start test
         self.mox.ReplayAll()
@@ -1522,9 +1526,10 @@ class ComputeTestCase(BaseTestCase):
         self.mox.StubOutWithMock(self.compute.driver, 'unfilter_instance')
         self.compute.driver.unfilter_instance(i_ref, [])
         self.mox.StubOutWithMock(rpc, 'call')
-        rpc.call(c, db.queue_get_for(c, FLAGS.compute_topic, dest),
+        rpc.call(c, rpc.queue_get_for(c, FLAGS.compute_topic, dest),
             {"method": "post_live_migration_at_destination",
-             "args": {'instance_id': i_ref['id'], 'block_migration': False}})
+             "args": {'instance_id': i_ref['id'], 'block_migration': False},
+             "version": compute_rpcapi.ComputeAPI.RPC_API_VERSION}, None)
         self.mox.StubOutWithMock(self.compute.driver, 'unplug_vifs')
         self.compute.driver.unplug_vifs(i_ref, [])
         rpc.call(c, 'network', {'method': 'setup_networks_on_host',
@@ -3439,6 +3444,24 @@ class ComputeAPITestCase(BaseTestCase):
 
         db.instance_destroy(self.context, refs[0]['id'])
 
+    def test_instance_architecture(self):
+        """Test the instance architecture"""
+        i_ref = self._create_fake_instance()
+        self.assertEqual(i_ref['architecture'], 'x86_64')
+        db.instance_destroy(self.context, i_ref['id'])
+
+    def test_instance_unknown_architecture(self):
+        """Test if the architecture is unknown."""
+        instance = self._create_fake_instance(
+                        params={'architecture': ''})
+        try:
+            self.compute.run_instance(self.context, instance['uuid'])
+            instances = db.instance_get_all(context.get_admin_context())
+            instance = instances[0]
+            self.assertNotEqual(instance['architecture'], 'Unknown')
+        finally:
+            db.instance_destroy(self.context, instance['id'])
+
     def test_instance_name_template(self):
         """Test the instance_name template"""
         self.flags(instance_name_template='instance-%d')
@@ -4075,13 +4098,14 @@ class KeypairAPITestCase(BaseTestCase):
         self.keypair_api = compute_api.KeypairAPI()
         self.ctxt = context.RequestContext('fake', 'fake')
         self._keypair_db_call_stubs()
-        self.pub_key = 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDLnVkqJu9WVf' \
-                  '/5StU3JCrBR2r1s1j8K1tux+5XeSvdqaM8lMFNorzbY5iyoBbRS56gy' \
-                  '1jmm43QsMPJsrpfUZKcJpRENSe3OxIIwWXRoiapZe78u/a9xKwj0avF' \
-                  'YMcws9Rk9iAB7W4K1nEJbyCPl5lRBoyqeHBqrnnuXWEgGxJCK0Ah6wc' \
-                  'OzwlEiVjdf4kxzXrwPHyi7Ea1qvnNXTziF8yYmUlH4C8UXfpTQckwSw' \
-                  'pDyxZUc63P8q+vPbs3Q2kw+/7vvkCKHJAXVI+oCiyMMfffoTq16M1xf' \
-                  'V58JstgtTqAXG+ZFpicGajREUE/E3hO5MGgcHmyzIrWHKpe1n3oEGuz'
+        self.pub_key = ('ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDLnVkqJu9WVf'
+                        '/5StU3JCrBR2r1s1j8K1tux+5XeSvdqaM8lMFNorzbY5iyoBbR'
+                        'S56gy1jmm43QsMPJsrpfUZKcJpRENSe3OxIIwWXRoiapZe78u/'
+                        'a9xKwj0avFYMcws9Rk9iAB7W4K1nEJbyCPl5lRBoyqeHBqrnnu'
+                        'XWEgGxJCK0Ah6wcOzwlEiVjdf4kxzXrwPHyi7Ea1qvnNXTziF8'
+                        'yYmUlH4C8UXfpTQckwSwpDyxZUc63P8q+vPbs3Q2kw+/7vvkCK'
+                        'HJAXVI+oCiyMMfffoTq16M1xfV58JstgtTqAXG+ZFpicGajREU'
+                        'E/E3hO5MGgcHmyzIrWHKpe1n3oEGuz')
         self.fingerprint = '4e:48:c6:a0:4a:f9:dd:b5:4c:85:54:5a:af:43:47:5a'
 
     def _keypair_db_call_stubs(self):

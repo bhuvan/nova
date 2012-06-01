@@ -284,27 +284,6 @@ def novadir():
     return os.path.abspath(nova.__file__).split('nova/__init__.py')[0]
 
 
-def default_cfgfile(filename='nova.conf', args=None):
-    if args is None:
-        args = sys.argv
-    for arg in args:
-        if arg.find('config-file') != -1:
-            return arg[arg.index('config-file') + len('config-file') + 1:]
-    else:
-        if not os.path.isabs(filename):
-            # turn relative filename into an absolute path
-            script_dir = os.path.dirname(inspect.stack()[-1][1])
-            filename = os.path.abspath(os.path.join(script_dir, filename))
-        if not os.path.exists(filename):
-            filename = "./nova.conf"
-            if not os.path.exists(filename):
-                filename = '/etc/nova/nova.conf'
-        if os.path.exists(filename):
-            cfgfile = '--config-file=%s' % filename
-            args.insert(1, cfgfile)
-            return filename
-
-
 def debug(arg):
     LOG.debug(_('debug in callback: %s'), arg)
     return arg
@@ -488,7 +467,7 @@ def utcnow_ts():
     return time.mktime(utcnow().timetuple())
 
 
-def set_time_override(override_time=datetime.datetime.utcnow()):
+def set_time_override(override_time=utcnow()):
     """Override utils.utcnow to return a constant time."""
     utcnow.override_time = override_time
 
@@ -524,7 +503,7 @@ def parse_strtime(timestr, fmt=PERFECT_TIME_FORMAT):
 def isotime(at=None):
     """Stringify time in ISO 8601 format"""
     if not at:
-        at = datetime.datetime.utcnow()
+        at = utcnow()
     str = at.strftime(ISO_TIME_FORMAT)
     tz = at.tzinfo.tzname(None) if at.tzinfo else 'UTC'
     str += ('Z' if tz == 'UTC' else tz)
@@ -1137,7 +1116,7 @@ def generate_glance_url():
 
 
 def generate_image_url(image_ref):
-    """Generate a image URL from an image_ref."""
+    """Generate an image URL from an image_ref."""
     return "%s/images/%s" % (generate_glance_url(), image_ref)
 
 

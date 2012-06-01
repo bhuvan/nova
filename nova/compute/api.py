@@ -41,6 +41,7 @@ from nova import flags
 import nova.image
 from nova import log as logging
 from nova import network
+from nova import notifications
 from nova.openstack.common import cfg
 from nova.openstack.common import excutils
 from nova.openstack.common import jsonutils
@@ -386,6 +387,9 @@ class API(base.Base):
         if reservation_id is None:
             reservation_id = utils.generate_uid('r')
 
+        # grab the architecture from glance
+        architecture = image['properties'].get('architecture', 'Unknown')
+
         root_device_name = block_device.properties_root_device_name(
             image['properties'])
 
@@ -420,6 +424,7 @@ class API(base.Base):
             'access_ip_v6': access_ip_v6,
             'availability_zone': availability_zone,
             'root_device_name': root_device_name,
+            'architecture': architecture,
             'progress': 0}
 
         options_from_image = self._inherit_properties_from_image(
@@ -599,6 +604,11 @@ class API(base.Base):
         instance_id = instance['id']
         instance_uuid = instance['uuid']
 
+        # send a state update notification for the initial create to
+        # show it going from non-existent to BUILDING
+        notifications.send_update_with_states(context, instance, None,
+                vm_states.BUILDING, None, None, service="api")
+
         for security_group_id in security_groups:
             self.db.instance_add_security_group(elevated,
                                                 instance_uuid,
@@ -629,6 +639,8 @@ class API(base.Base):
         updates['hostname'] = utils.sanitize_hostname(hostname)
         updates['vm_state'] = vm_states.BUILDING
         updates['task_state'] = task_states.SCHEDULING
+
+        updates['architecture'] = image['properties'].get('architecture')
 
         if (image['properties'].get('mappings', []) or
             image['properties'].get('block_device_mapping', []) or
@@ -828,9 +840,7 @@ class API(base.Base):
         hosts = [x['host'] for (x, idx)
                            in self.db.service_get_all_compute_sorted(context)]
         for host in hosts:
-            rpc.cast(context,
-                     self.db.queue_get_for(context, FLAGS.compute_topic, host),
-                     {'method': 'refresh_provider_fw_rules', 'args': {}})
+            self.compute_rpcapi.refresh_provider_fw_rules(context, host)
 
     def _is_security_group_associated_with_server(self, security_group,
                                                   instance_uuid):
@@ -919,8 +929,15 @@ class API(base.Base):
 
         :returns: None
         """
-        rv = self.db.instance_update(context, instance["id"], kwargs)
-        return dict(rv.iteritems())
+
+        # Update the instance record and send a state update notification
+        # if task or vm state changed
+        old_ref, instance_ref = self.db.instance_update_and_get_original(
+                context, instance["id"], kwargs)
+        notifications.send_update(context, old_ref, instance_ref,
+                service="api")
+
+        return dict(instance_ref.iteritems())
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
@@ -1032,7 +1049,7 @@ class API(base.Base):
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
                                     vm_states.RESCUED],
-                          task_state=[None, task_states.RESIZE_VERIFY])
+                          task_state=[None])
     def stop(self, context, instance, do_cast=True):
         """Stop an instance."""
         instance_uuid = instance["uuid"]
@@ -1260,8 +1277,16 @@ class API(base.Base):
         else:
             raise Exception(_('Image type not recognized %s') % image_type)
 
+        # change instance state and notify
+        old_vm_state = instance["vm_state"]
+        old_task_state = instance["task_state"]
+
         self.db.instance_test_and_set(
                 context, instance_uuid, 'task_state', [None], task_state)
+
+        notifications.send_update_with_states(context, instance, old_vm_state,
+                instance["vm_state"], old_task_state, instance["task_state"],
+                service="api")
 
         properties = {
             'instance_uuid': instance_uuid,
@@ -1313,7 +1338,7 @@ class API(base.Base):
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
                                     vm_states.RESCUED],
-                          task_state=[None, task_states.RESIZE_VERIFY])
+                          task_state=[None])
     def reboot(self, context, instance, reboot_type):
         """Reboot the given instance."""
         state = {'SOFT': task_states.REBOOTING,
@@ -1333,7 +1358,7 @@ class API(base.Base):
 
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF],
-                          task_state=[None, task_states.RESIZE_VERIFY])
+                          task_state=[None])
     def rebuild(self, context, instance, image_href, admin_password, **kwargs):
         """Rebuild the given instance with the provided attributes."""
 
@@ -1526,7 +1551,7 @@ class API(base.Base):
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
                                     vm_states.RESCUED],
-                          task_state=[None, task_states.RESIZE_VERIFY])
+                          task_state=[None])
     def pause(self, context, instance):
         """Pause the given instance."""
         self.update(context,
@@ -1553,7 +1578,7 @@ class API(base.Base):
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
                                     vm_states.RESCUED],
-                          task_state=[None, task_states.RESIZE_VERIFY])
+                          task_state=[None])
     def suspend(self, context, instance):
         """Suspend the given instance."""
         self.update(context,
@@ -1575,7 +1600,7 @@ class API(base.Base):
     @wrap_check_policy
     @check_instance_state(vm_state=[vm_states.ACTIVE, vm_states.SHUTOFF,
                                     vm_states.STOPPED],
-                          task_state=[None, task_states.RESIZE_VERIFY])
+                          task_state=[None])
     def rescue(self, context, instance, rescue_password=None):
         """Rescue the given instance."""
         self.update(context,
@@ -1597,7 +1622,8 @@ class API(base.Base):
         self.compute_rpcapi.unrescue_instance(context, instance=instance)
 
     @wrap_check_policy
-    @check_instance_state(vm_state=[vm_states.ACTIVE])
+    @check_instance_state(vm_state=[vm_states.ACTIVE],
+                          task_state=[None])
     def set_admin_password(self, context, instance, password=None):
         """Set the root/admin password for the given instance."""
         self.update(context,
@@ -1627,7 +1653,7 @@ class API(base.Base):
 
     @wrap_check_policy
     def get_console_output(self, context, instance, tail_length=None):
-        """Get console output for an an instance."""
+        """Get console output for an instance."""
         return self.compute_rpcapi.get_console_output(context,
                 instance=instance, tail_length=tail_length)
 
@@ -1789,7 +1815,6 @@ class HostAPI(base.Base):
         """Reboots, shuts down or powers up the host."""
         # NOTE(comstud): No instance_uuid argument to this compute manager
         # call
-        topic = self.db.queue_get_for(context, FLAGS.compute_topic, host)
         return self.compute_rpcapi.host_power_action(context, action=action,
                 host=host)
 

@@ -18,7 +18,6 @@
 
 import ast
 import contextlib
-import datetime
 import functools
 import os
 import re
@@ -29,7 +28,6 @@ from nova.compute import aggregate_states
 from nova.compute import instance_types
 from nova.compute import power_state
 from nova.compute import task_states
-from nova.compute import utils as compute_utils
 from nova.compute import vm_states
 from nova import context
 from nova import db
@@ -43,6 +41,7 @@ from nova.tests import fake_network
 from nova.tests import fake_utils
 from nova.tests.glance import stubs as glance_stubs
 from nova.tests.xenapi import stubs
+from nova import utils
 from nova.virt.xenapi import connection as xenapi_conn
 from nova.virt.xenapi import fake as xenapi_fake
 from nova.virt.xenapi import vm_utils
@@ -167,12 +166,10 @@ class XenAPIVolumeTestCase(test.TestCase):
         """This shows how to test helper classes' methods."""
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVolumeTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        helper = volume_utils.VolumeHelper
-        helper.XenAPI = session.get_imported_xenapi()
         vol = self._create_volume()
         # oops, wrong mount point!
         self.assertRaises(volume_utils.StorageError,
-                          helper.parse_volume_info,
+                          volume_utils.VolumeHelper.parse_volume_info,
                           self._make_info(),
                           'dev/sd'
                           )
@@ -272,14 +269,18 @@ class XenAPIVMTestCase(test.TestCase):
 
         fake_diagnostics = {
             'vbd_xvdb_write': '0.0',
-            'memory_target': '10961792000.0000',
-            'memory_internal_free': '3612860.6020',
-            'memory': '10961792000.0000',
+            'memory_target': '4294967296.0000',
+            'memory_internal_free': '1415564.0000',
+            'memory': '4294967296.0000',
             'vbd_xvda_write': '0.0',
-            'cpu0': '0.0110',
-            'vif_0_tx': '752.4007',
+            'cpu0': '0.0042',
+            'vif_0_tx': '287.4134',
             'vbd_xvda_read': '0.0',
-            'vif_0_rx': '4837.8805'
+            'vif_0_rx': '1816.0144',
+            'vif_2_rx': '0.0',
+            'vif_2_tx': '0.0',
+            'vbd_xvdb_read': '0.0',
+            'last_update': '1328795567',
         }
         instance = self._create_instance()
         expected = self.conn.get_diagnostics(instance)
@@ -377,24 +378,28 @@ class XenAPIVMTestCase(test.TestCase):
         if check_injection:
             xenstore_data = self.vm['xenstore_data']
             self.assertEquals(xenstore_data['vm-data/hostname'], 'test')
-            key = 'vm-data/networking/DEADBEEF0000'
+            key = 'vm-data/networking/DEADBEEF0001'
             xenstore_value = xenstore_data[key]
             tcpip_data = ast.literal_eval(xenstore_value)
             self.assertEquals(tcpip_data,
-                              {'broadcast': '192.168.0.255',
-                               'dns': ['192.168.0.1'],
-                               'gateway': '192.168.0.1',
-                               'gateway_v6': 'dead:beef::1',
+                              {'broadcast': '192.168.1.255',
+                               'dns': ['192.168.1.3', '192.168.1.4'],
+                               'gateway': '192.168.1.1',
+                               'gateway_v6': 'fe80::def',
                                'ip6s': [{'enabled': '1',
-                                         'ip': 'dead:beef::dcad:beff:feef:0',
-                                               'netmask': '64'}],
+                                         'ip': '2001:db8:0:1::1',
+                                         'netmask': 64,
+                                         'gateway': 'fe80::def'}],
                                'ips': [{'enabled': '1',
-                                        'ip': '192.168.0.100',
-                                        'netmask': '255.255.255.0'}],
-                               'dhcp_server': '192.168.0.1',
-                               'label': 'fake',
-                               'mac': 'DE:AD:BE:EF:00:00',
-                               'rxtx_cap': 3})
+                                        'ip': '192.168.1.100',
+                                        'netmask': '255.255.255.0',
+                                        'gateway': '192.168.1.1'},
+                                       {'enabled': '1',
+                                        'ip': '192.168.1.101',
+                                        'netmask': '255.255.255.0',
+                                        'gateway': '192.168.1.1'}],
+                               'label': 'test1',
+                               'mac': 'DE:AD:BE:EF:00:01'})
 
     def check_vm_params_for_windows(self):
         self.assertEquals(self.vm['platform']['nx'], 'true')
@@ -442,7 +447,7 @@ class XenAPIVMTestCase(test.TestCase):
                 # If the cache is turned on then the base disk will be
                 # there even after the cleanup
                 if 'other_config' in vdi_rec:
-                    if vdi_rec['other_config']['image-id'] is None:
+                    if 'image-id' not in vdi_rec['other_config']:
                         self.fail('Found unexpected VDI:%s' % vdi_ref)
                 else:
                     self.fail('Found unexpected VDI:%s' % vdi_ref)
@@ -467,27 +472,12 @@ class XenAPIVMTestCase(test.TestCase):
             instance = db.instance_create(self.context, instance_values)
         else:
             instance = db.instance_get(self.context, instance_id)
-        network_info = [({'bridge': 'fa0', 'id': 0,
-                          'injected': True,
-                          'cidr': '192.168.0.0/24',
-                          'cidr_v6': 'dead:beef::1/120',
-                          },
-                          {'broadcast': '192.168.0.255',
-                           'dns': ['192.168.0.1'],
-                           'gateway': '192.168.0.1',
-                           'gateway_v6': 'dead:beef::1',
-                           'ip6s': [{'enabled': '1',
-                                     'ip': 'dead:beef::dcad:beff:feef:0',
-                                           'netmask': '64'}],
-                           'ips': [{'enabled': '1',
-                                    'ip': '192.168.0.100',
-                                    'netmask': '255.255.255.0'}],
-                           'dhcp_server': '192.168.0.1',
-                           'label': 'fake',
-                           'mac': 'DE:AD:BE:EF:00:00',
-                           'rxtx_cap': 3})]
+
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+                                                              spectacular=True)
         if empty_dns:
-            network_info[0][1]['dns'] = []
+            # NOTE(tr3buchet): this is a terrible way to do this...
+            network_info[0]['network']['subnets'][0]['dns'] = []
 
         # admin_pass isn't part of the DB model, but it does get set as
         # an attribute for spawn to use
@@ -605,11 +595,11 @@ class XenAPIVMTestCase(test.TestCase):
             index = config.index('auto eth0')
             self.assertEquals(config[index + 1:index + 8], [
                 'iface eth0 inet static',
-                'address 192.168.0.100',
+                'address 192.168.1.100',
                 'netmask 255.255.255.0',
-                'broadcast 192.168.0.255',
-                'gateway 192.168.0.1',
-                'dns-nameservers 192.168.0.1',
+                'broadcast 192.168.1.255',
+                'gateway 192.168.1.1',
+                'dns-nameservers 192.168.1.3 192.168.1.4',
                 ''])
             self._tee_executed = True
             return '', ''
@@ -708,7 +698,7 @@ class XenAPIVMTestCase(test.TestCase):
             vif_rec = xenapi_fake.get_record('VIF', vif_ref)
             self.assertEquals(vif_rec['qos_algorithm_type'], 'ratelimit')
             self.assertEquals(vif_rec['qos_algorithm_params']['kbps'],
-                              str(3 * 1024))
+                              str(3 * 10 * 1024))
 
     def test_rescue(self):
         instance = self._create_instance()
@@ -778,25 +768,8 @@ class XenAPIVMTestCase(test.TestCase):
             'os_type': 'linux',
             'architecture': 'x86-64'}
         instance = db.instance_create(self.context, instance_values)
-        network_info = [({'bridge': 'fa0', 'id': 0,
-                          'injected': False,
-                          'cidr': '192.168.0.0/24',
-                          'cidr_v6': 'dead:beef::1/120',
-                          },
-                          {'broadcast': '192.168.0.255',
-                           'dns': ['192.168.0.1'],
-                           'gateway': '192.168.0.1',
-                           'gateway_v6': 'dead:beef::1',
-                           'ip6s': [{'enabled': '1',
-                                     'ip': 'dead:beef::dcad:beff:feef:0',
-                                           'netmask': '64'}],
-                           'ips': [{'enabled': '1',
-                                    'ip': '192.168.0.100',
-                                    'netmask': '255.255.255.0'}],
-                           'dhcp_server': '192.168.0.1',
-                           'label': 'fake',
-                           'mac': 'DE:AD:BE:EF:00:00',
-                           'rxtx_cap': 3})]
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+                                                              spectacular=True)
         image_meta = {'id': glance_stubs.FakeGlance.IMAGE_VHD,
                       'disk_format': 'vhd'}
         if spawn:
@@ -951,20 +924,8 @@ class XenAPIMigrateInstance(test.TestCase):
                        fake_finish_revert_migration)
 
         conn = xenapi_conn.get_connection(False)
-        network_info = [({'bridge': 'fa0', 'id': 0, 'injected': False},
-                          {'broadcast': '192.168.0.255',
-                           'dns': ['192.168.0.1'],
-                           'gateway': '192.168.0.1',
-                           'gateway_v6': 'dead:beef::1',
-                           'ip6s': [{'enabled': '1',
-                                     'ip': 'dead:beef::dcad:beff:feef:0',
-                                     'netmask': '64'}],
-                           'ips': [{'enabled': '1',
-                                    'ip': '192.168.0.100',
-                                    'netmask': '255.255.255.0'}],
-                           'label': 'fake',
-                           'mac': 'DE:AD:BE:EF:00:00',
-                           'rxtx_cap': 3})]
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+                                                              spectacular=True)
         image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
         base = xenapi_fake.create_vdi('hurr', 'fake')
         base_uuid = xenapi_fake.get_record('VDI', base)['uuid']
@@ -995,20 +956,8 @@ class XenAPIMigrateInstance(test.TestCase):
                        "VDI_resize_online", fake_vdi_resize)
 
         conn = xenapi_conn.get_connection(False)
-        network_info = [({'bridge': 'fa0', 'id': 0, 'injected': False},
-                          {'broadcast': '192.168.0.255',
-                           'dns': ['192.168.0.1'],
-                           'gateway': '192.168.0.1',
-                           'gateway_v6': 'dead:beef::1',
-                           'ip6s': [{'enabled': '1',
-                                     'ip': 'dead:beef::dcad:beff:feef:0',
-                                           'netmask': '64'}],
-                           'ips': [{'enabled': '1',
-                                    'ip': '192.168.0.100',
-                                    'netmask': '255.255.255.0'}],
-                           'label': 'fake',
-                           'mac': 'DE:AD:BE:EF:00:00',
-                           'rxtx_cap': 3})]
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+                                                              spectacular=True)
         image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
         conn.finish_migration(self.context, self.migration, instance,
                               dict(base_copy='hurr', cow='durr'),
@@ -1029,20 +978,8 @@ class XenAPIMigrateInstance(test.TestCase):
         self.stubs.Set(stubs.FakeSessionForVMTests,
                        "VDI_resize_online", fake_vdi_resize)
         conn = xenapi_conn.get_connection(False)
-        network_info = [({'bridge': 'fa0', 'id': 0, 'injected': False},
-                          {'broadcast': '192.168.0.255',
-                           'dns': ['192.168.0.1'],
-                           'gateway': '192.168.0.1',
-                           'gateway_v6': 'dead:beef::1',
-                           'ip6s': [{'enabled': '1',
-                                     'ip': 'dead:beef::dcad:beff:feef:0',
-                                           'netmask': '64'}],
-                           'ips': [{'enabled': '1',
-                                    'ip': '192.168.0.100',
-                                    'netmask': '255.255.255.0'}],
-                           'label': 'fake',
-                           'mac': 'DE:AD:BE:EF:00:00',
-                           'rxtx_cap': 3})]
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+                                                              spectacular=True)
         image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
         conn.finish_migration(self.context, self.migration, instance,
                               dict(base_copy='hurr', cow='durr'),
@@ -1057,21 +994,8 @@ class XenAPIMigrateInstance(test.TestCase):
         self.stubs.Set(stubs.FakeSessionForVMTests,
                        "VDI_resize_online", fake_vdi_resize)
         conn = xenapi_conn.get_connection(False)
-        network_info = [({'bridge': 'fa0', 'id': 0, 'injected': False},
-                          {'broadcast': '192.168.0.255',
-                           'dns': ['192.168.0.1'],
-                           'gateway': '192.168.0.1',
-                           'gateway_v6': 'dead:beef::1',
-                           'ip6s': [{'enabled': '1',
-                                     'ip': 'dead:beef::dcad:beff:feef:0',
-                                           'netmask': '64'}],
-                           'ips': [{'enabled': '1',
-                                    'ip': '192.168.0.100',
-                                    'netmask': '255.255.255.0'}],
-                           'label': 'fake',
-                           'mac': 'DE:AD:BE:EF:00:00',
-                           'rxtx_cap': 3})]
-
+        network_info = fake_network.fake_get_instance_nw_info(self.stubs,
+                                                              spectacular=True)
         # Resize instance would be determined by the compute call
         image_meta = {'id': instance.image_ref, 'disk_format': 'vhd'}
         conn.finish_migration(self.context, self.migration, instance,
@@ -1398,8 +1322,7 @@ class XenAPIBWUsageTestCase(test.TestCase):
                 self.name = "instance-0001"
                 self.uuid = "1-2-3-4-5"
 
-        result = self.conn.get_all_bw_usage([testinstance()],
-                datetime.datetime.utcnow())
+        result = self.conn.get_all_bw_usage([testinstance()], utils.utcnow())
         self.assertEqual(result, [])
 
 
@@ -1569,7 +1492,7 @@ class XenAPIDom0IptablesFirewallTestCase(test.TestCase):
         fake_network.stub_out_nw_api_get_instance_nw_info(self.stubs,
                                       lambda *a, **kw: network_model)
 
-        network_info = compute_utils.legacy_network_info(network_model)
+        network_info = network_model.legacy()
         self.fw.prepare_instance_filter(instance_ref, network_info)
         self.fw.apply_instance_filter(instance_ref, network_info)
 
@@ -1718,18 +1641,14 @@ class XenAPISRSelectionTestCase(test.TestCase):
         self.flags(sr_matching_filter='yadayadayada')
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        helper = vm_utils.VMHelper
-        helper.XenAPI = session.get_imported_xenapi()
         self.assertRaises(exception.StorageRepositoryNotFound,
-                          helper.safe_find_sr, session)
+                          vm_utils.VMHelper.safe_find_sr, session)
 
     def test_safe_find_sr_local_storage(self):
         """Ensure the default local-storage is found."""
         self.flags(sr_matching_filter='other-config:i18n-key=local-storage')
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        helper = vm_utils.VMHelper
-        helper.XenAPI = session.get_imported_xenapi()
         host_ref = xenapi_fake.get_all('host')[0]
         local_sr = xenapi_fake.create_sr(
                               name_label='Fake Storage',
@@ -1738,7 +1657,7 @@ class XenAPISRSelectionTestCase(test.TestCase):
                                             'Local storage',
                                             'i18n-key': 'local-storage'},
                               host_ref=host_ref)
-        expected = helper.safe_find_sr(session)
+        expected = vm_utils.VMHelper.safe_find_sr(session)
         self.assertEqual(local_sr, expected)
 
     def test_safe_find_sr_by_other_criteria(self):
@@ -1746,14 +1665,12 @@ class XenAPISRSelectionTestCase(test.TestCase):
         self.flags(sr_matching_filter='other-config:my_fake_sr=true')
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        helper = vm_utils.VMHelper
-        helper.XenAPI = session.get_imported_xenapi()
         host_ref = xenapi_fake.get_all('host')[0]
         local_sr = xenapi_fake.create_sr(name_label='Fake Storage',
                                          type='lvm',
                                          other_config={'my_fake_sr': 'true'},
                                          host_ref=host_ref)
-        expected = helper.safe_find_sr(session)
+        expected = vm_utils.VMHelper.safe_find_sr(session)
         self.assertEqual(local_sr, expected)
 
     def test_safe_find_sr_default(self):
@@ -1761,10 +1678,8 @@ class XenAPISRSelectionTestCase(test.TestCase):
         self.flags(sr_matching_filter='default-sr:true')
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        helper = vm_utils.VMHelper
         pool_ref = xenapi_fake.create_pool('')
-        helper.XenAPI = session.get_imported_xenapi()
-        expected = helper.safe_find_sr(session)
+        expected = vm_utils.VMHelper.safe_find_sr(session)
         self.assertEqual(session.call_xenapi('pool.get_default_SR', pool_ref),
                          expected)
 

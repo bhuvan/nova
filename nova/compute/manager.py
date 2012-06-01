@@ -50,6 +50,7 @@ from nova import compute
 from nova.compute import aggregate_states
 from nova.compute import instance_types
 from nova.compute import power_state
+from nova.compute import rpcapi as compute_rpcapi
 from nova.compute import task_states
 from nova.compute import utils as compute_utils
 from nova.compute import vm_states
@@ -61,6 +62,7 @@ from nova import log as logging
 from nova import manager
 from nova import network
 from nova.network import model as network_model
+from nova import notifications
 from nova.notifier import api as notifier
 from nova.openstack.common import cfg
 from nova.openstack.common import excutils
@@ -247,13 +249,19 @@ class ComputeManager(manager.SchedulerDependentManager):
         self._last_bw_usage_poll = 0
         self._last_info_cache_heal = 0
         self.compute_api = compute.API()
+        self.compute_rpcapi = compute_rpcapi.ComputeAPI()
 
         super(ComputeManager, self).__init__(service_name="compute",
                                              *args, **kwargs)
 
     def _instance_update(self, context, instance_id, **kwargs):
         """Update an instance in the database using kwargs as value."""
-        return self.db.instance_update(context, instance_id, kwargs)
+
+        (old_ref, instance_ref) = self.db.instance_update_and_get_original(
+                context, instance_id, kwargs)
+        notifications.send_update(context, old_ref, instance_ref)
+
+        return instance_ref
 
     def _set_instance_error_state(self, context, instance_uuid):
         try:
@@ -309,9 +317,9 @@ class ComputeManager(manager.SchedulerDependentManager):
 
         """
         #TODO(mdragon): perhaps make this variable by console_type?
-        return self.db.queue_get_for(context,
-                                     FLAGS.console_topic,
-                                     FLAGS.console_host)
+        return rpc.queue_get_for(context,
+                                 FLAGS.console_topic,
+                                 FLAGS.console_host)
 
     def get_console_pool_info(self, context, console_type):
         return self.driver.get_console_pool_info(console_type)
@@ -355,7 +363,7 @@ class ComputeManager(manager.SchedulerDependentManager):
     def _legacy_nw_info(self, network_info):
         """Converts the model nw_info object to legacy style"""
         if self.driver.legacy_nwinfo():
-            network_info = compute_utils.legacy_network_info(network_info)
+            network_info = network_info.legacy()
         return network_info
 
     def _setup_block_device_mapping(self, context, instance):
@@ -393,7 +401,12 @@ class ComputeManager(manager.SchedulerDependentManager):
                                              '', '', snapshot)
                 # TODO(yamahata): creating volume simultaneously
                 #                 reduces creation time?
-                self.volume_api.wait_creation(context, vol)
+                # TODO(yamahata): eliminate dumb polling
+                while True:
+                    volume = self.volume_api.get(context, vol['id'])
+                    if volume['status'] != 'creating':
+                        break
+                    greenthread.sleep(1)
                 self.db.block_device_mapping_update(
                     context, bdm['id'], {'volume_id': vol['id']})
                 bdm['volume_id'] = vol['id']
@@ -1251,13 +1264,8 @@ class ComputeManager(manager.SchedulerDependentManager):
 
         network_info = self._get_instance_nw_info(context, instance_ref)
         self.driver.destroy(instance_ref, self._legacy_nw_info(network_info))
-        topic = self.db.queue_get_for(context, FLAGS.compute_topic,
-                migration_ref['source_compute'])
-        rpc.cast(context, topic,
-                {'method': 'finish_revert_resize',
-                 'args': {'instance_uuid': instance_ref['uuid'],
-                          'migration_id': migration_ref['id']},
-                })
+        self.compute_rpcapi.finish_revert_resize(context, instance_ref,
+                migration_ref['id'], migration_ref['source_compute'])
 
     @exception.wrap_exception(notifier=notifier, publisher_id=publisher_id())
     @checks_instance_lock
@@ -1343,13 +1351,8 @@ class ComputeManager(manager.SchedulerDependentManager):
                  'status': 'pre-migrating'})
 
         LOG.audit(_('Migrating'), context=context, instance=instance_ref)
-        topic = self.db.queue_get_for(context, FLAGS.compute_topic,
-                instance_ref['host'])
-        rpc.cast(context, topic,
-                {'method': 'resize_instance',
-                 'args': {'instance_uuid': instance_ref['uuid'],
-                          'migration_id': migration_ref['id'],
-                          'image': image}})
+        self.compute_rpcapi.resize_instance(context, instance_ref,
+                migration_ref['id'], image)
 
         extra_usage_info = dict(new_instance_type=new_instance_type['name'],
                                 new_instance_type_id=new_instance_type['id'])
@@ -1372,7 +1375,7 @@ class ComputeManager(manager.SchedulerDependentManager):
         try:
             network_info = self._get_instance_nw_info(context, instance_ref)
         except Exception, error:
-            with utils.save_and_reraise_exception():
+            with excutils.save_and_reraise_exception():
                 msg = _('%s. Setting instance vm_state to ERROR')
                 LOG.error(msg % error)
                 self._set_instance_error_state(context, instance_uuid)
@@ -1404,17 +1407,8 @@ class ComputeManager(manager.SchedulerDependentManager):
         self._instance_update(context, instance_uuid,
                               task_state=task_states.RESIZE_MIGRATED)
 
-        service = self.db.service_get_by_host_and_topic(
-                context, migration_ref['dest_compute'], FLAGS.compute_topic)
-        topic = self.db.queue_get_for(context,
-                                      FLAGS.compute_topic,
-                                      migration_ref['dest_compute'])
-        params = {'migration_id': migration_id,
-                  'disk_info': disk_info,
-                  'instance_uuid': instance_ref['uuid'],
-                  'image': image}
-        rpc.cast(context, topic, {'method': 'finish_resize',
-                                  'args': params})
+        self.compute_rpcapi.finish_resize(context, instance_ref, migration_id,
+                image, disk_info, migration_ref['dest_compute'])
 
         self._notify_about_instance_usage(context, instance_ref, "resize.end",
                                           network_info=network_info)
@@ -2033,12 +2027,8 @@ class ComputeManager(manager.SchedulerDependentManager):
             else:
                 disk = None
 
-            rpc.call(context,
-                     self.db.queue_get_for(context, FLAGS.compute_topic, dest),
-                     {'method': 'pre_live_migration',
-                      'args': {'instance_id': instance_id,
-                               'block_migration': block_migration,
-                               'disk': disk}})
+            self.compute_rpcapi.pre_live_migration(context, instance_ref,
+                    block_migration, disk, dest)
 
         except Exception:
             with excutils.save_and_reraise_exception():
@@ -2115,11 +2105,8 @@ class ComputeManager(manager.SchedulerDependentManager):
 
         # Define domain at destination host, without doing it,
         # pause/suspend/terminate do not work.
-        rpc.call(ctxt,
-                 self.db.queue_get_for(ctxt, FLAGS.compute_topic, dest),
-                     {"method": "post_live_migration_at_destination",
-                      "args": {'instance_id': instance_ref['id'],
-                               'block_migration': block_migration}})
+        self.compute_rpcapi.post_live_migration_at_destination(ctxt,
+                instance_ref, block_migration, dest)
 
         # No instance booting at source host, but instance dir
         # must be deleted for preparing next block migration
@@ -2210,20 +2197,18 @@ class ComputeManager(manager.SchedulerDependentManager):
                                                   instance_ref['uuid']):
             volume_id = bdm['volume_id']
             volume = self.volume_api.get(context, volume_id)
-            self.volume_api.update(context, volume, {'status': 'in-use'})
-            self.volume_api.remove_from_compute(context,
-                                                volume,
-                                                instance_ref['id'],
-                                                dest)
+            rpc.call(context,
+                     rpc.queue_get_for(context, FLAGS.compute_topic, dest),
+                     {"method": "remove_volume_connection",
+                      "args": {'instance_id': instance_ref['id'],
+                               'volume_id': volume['id']}})
 
         # Block migration needs empty image at destination host
         # before migration starts, so if any failure occurs,
         # any empty images has to be deleted.
         if block_migration:
-            rpc.cast(context,
-                     self.db.queue_get_for(context, FLAGS.compute_topic, dest),
-                     {"method": "rollback_live_migration_at_destination",
-                      "args": {'instance_id': instance_ref['id']}})
+            self.compute_rpcapi.rollback_live_migration_at_destination(context,
+                    instance_ref, dest)
 
     def rollback_live_migration_at_destination(self, context, instance_id):
         """ Cleaning up image directory that is created pre_live_migration.

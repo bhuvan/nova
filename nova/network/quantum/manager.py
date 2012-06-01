@@ -283,15 +283,15 @@ class QuantumManager(manager.FloatingIP, manager.FlatManager):
 
         # Now we can delete the network
         self.q_conn.delete_network(q_tenant_id, net_uuid)
-        LOG.debug("Deleting network %s for tenant: %s" % \
-                                    (net_uuid, q_tenant_id))
+        LOG.debug("Deleting network %s for tenant: %s" %
+                  (net_uuid, q_tenant_id))
         self.ipam.delete_subnets_by_net_id(context, net_uuid, project_id)
         # Get rid of dnsmasq
         if FLAGS.quantum_use_dhcp:
             if net_ref['host'] == self.host:
                 self.kill_dhcp(net_ref)
             else:
-                topic = self.db.queue_get_for(context,
+                topic = rpc.queue_get_for(context,
                         FLAGS.network_topic,
                         net_ref['host'])
 
@@ -389,7 +389,7 @@ class QuantumManager(manager.FloatingIP, manager.FlatManager):
                     self.enable_dhcp(context, network['quantum_net_id'],
                             network, vif_rec, network['net_tenant_id'])
                 else:
-                    topic = self.db.queue_get_for(context,
+                    topic = rpc.queue_get_for(context,
                                 FLAGS.network_topic, network['host'])
                     rpc.call(context, topic, {'method': 'enable_dhcp',
                         'args': {'quantum_net_id': network['quantum_net_id'],
@@ -577,7 +577,7 @@ class QuantumManager(manager.FloatingIP, manager.FlatManager):
         nw_info = self.build_network_info_model(context, vifs, networks,
                                                 rxtx_factor, host)
         db.instance_info_cache_update(context, instance_uuid,
-                                      {'network_info': nw_info.as_cache()})
+                                      {'network_info': nw_info.json()})
 
         return nw_info
 
@@ -608,7 +608,7 @@ class QuantumManager(manager.FloatingIP, manager.FlatManager):
                     self.update_dhcp(context, ipam_tenant_id, network,
                                  vif, project_id)
                 else:
-                    topic = self.db.queue_get_for(context,
+                    topic = rpc.queue_get_for(context,
                                 FLAGS.network_topic, network['host'])
                     rpc.call(context, topic, {'method': 'update_dhcp',
                         'args': {'ipam_tenant_id': ipam_tenant_id,

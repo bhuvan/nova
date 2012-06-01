@@ -366,9 +366,9 @@ class XenAPIConnection(driver.ComputeDriver):
 
     def get_console_pool_info(self, console_type):
         xs_url = urlparse.urlparse(FLAGS.xenapi_connection_url)
-        return  {'address': xs_url.netloc,
-                 'username': FLAGS.xenapi_connection_username,
-                 'password': FLAGS.xenapi_connection_password}
+        return {'address': xs_url.netloc,
+                'username': FLAGS.xenapi_connection_username,
+                'password': FLAGS.xenapi_connection_password}
 
     def update_available_resource(self, ctxt, host):
         """Updates compute manager resource info on ComputeNode table.
@@ -491,6 +491,13 @@ class XenAPIConnection(driver.ComputeDriver):
         """Remove a compute host from an aggregate."""
         return self._pool.remove_from_aggregate(context,
                                                 aggregate, host, **kwargs)
+
+    def legacy_nwinfo(self):
+        """
+        Indicate if the driver requires the legacy network_info format.
+        """
+        # TODO(tr3buchet): remove this function once all virts return false
+        return False
 
 
 class XenAPISession(object):

@@ -31,7 +31,12 @@ FLAGS = flags.FLAGS
 class ComputeRpcAPITestCase(test.TestCase):
 
     def setUp(self):
-        self.fake_instance = {'uuid': 'fake_uuid', 'host': 'fake_host'}
+        self.fake_instance = {
+            'uuid': 'fake_uuid',
+            'host': 'fake_host',
+            'name': 'fake_name',
+            'id': 'fake_id',
+        }
         super(ComputeRpcAPITestCase, self).setUp()
 
     def tearDown(self):
@@ -41,6 +46,7 @@ class ComputeRpcAPITestCase(test.TestCase):
         ctxt = context.RequestContext('fake_user', 'fake_project')
         rpcapi = compute_rpcapi.ComputeAPI()
         expected_retval = 'foo' if method == 'call' else None
+
         expected_msg = rpcapi.make_msg(method, **kwargs)
         if 'host_param' in expected_msg['args']:
             host_param = expected_msg['args']['host_param']
@@ -51,8 +57,15 @@ class ComputeRpcAPITestCase(test.TestCase):
         if 'instance' in expected_msg['args']:
             instance = expected_msg['args']['instance']
             del expected_msg['args']['instance']
-            expected_msg['args']['instance_uuid'] = instance['uuid']
+            if method in ['rollback_live_migration_at_destination',
+                          'pre_live_migration',
+                          'post_live_migration_at_destination']:
+                expected_msg['args']['instance_id'] = instance['id']
+            else:
+                expected_msg['args']['instance_uuid'] = instance['uuid']
+
         expected_msg['version'] = rpcapi.RPC_API_VERSION
+
         cast_and_call = ['confirm_resize', 'stop_instance']
         if rpc_method == 'call' and method in cast_and_call:
             kwargs['cast'] = False
@@ -92,6 +105,10 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('attach_volume', 'cast',
                 instance=self.fake_instance, volume_id='id', mountpoint='mp')
 
+    def test_compare_cpu(self):
+        self._test_compute_api('compare_cpu', 'call', cpu_info='info',
+                host='host')
+
     def test_confirm_resize_cast(self):
         self._test_compute_api('confirm_resize', 'cast',
                 instance=self.fake_instance, migration_id='id', host='host')
@@ -104,9 +121,25 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('detach_volume', 'cast',
                 instance=self.fake_instance, volume_id='id')
 
+    def test_finish_resize(self):
+        self._test_compute_api('finish_resize', 'cast',
+                instance=self.fake_instance, migration_id='id',
+                image='image', disk_info='disk_info', host='host')
+
+    def test_finish_revert_resize(self):
+        self._test_compute_api('finish_revert_resize', 'cast',
+                instance=self.fake_instance, migration_id='id', host='host')
+
     def test_get_console_output(self):
         self._test_compute_api('get_console_output', 'call',
                 instance=self.fake_instance, tail_length='tl')
+
+    def test_get_console_pool_info(self):
+        self._test_compute_api('get_console_pool_info', 'call',
+                console_type='type', host='host')
+
+    def test_get_console_topic(self):
+        self._test_compute_api('get_console_topic', 'call', host='host')
 
     def test_get_diagnostics(self):
         self._test_compute_api('get_diagnostics', 'call',
@@ -136,6 +169,11 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('lock_instance', 'cast',
                 instance=self.fake_instance)
 
+    def test_post_live_migration_at_destination(self):
+        self._test_compute_api('post_live_migration_at_destination', 'call',
+                instance=self.fake_instance, block_migration='block_migration',
+                host='host')
+
     def test_pause_instance(self):
         self._test_compute_api('pause_instance', 'cast',
                 instance=self.fake_instance)
@@ -148,6 +186,11 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('power_on_instance', 'cast',
                 instance=self.fake_instance)
 
+    def test_pre_live_migration(self):
+        self._test_compute_api('pre_live_migration', 'call',
+                instance=self.fake_instance, block_migration='block_migration',
+                disk='disk', host='host')
+
     def test_reboot_instance(self):
         self._test_compute_api('reboot_instance', 'cast',
                 instance=self.fake_instance, reboot_type='type')
@@ -157,6 +200,10 @@ class ComputeRpcAPITestCase(test.TestCase):
                 instance=self.fake_instance, new_pass='pass',
                 injected_files='files', image_ref='ref',
                 orig_image_ref='orig_ref')
+
+    def refresh_provider_fw_rules(self):
+        self._test_compute_api('refresh_provider_fw_rules', 'cast',
+                host='host')
 
     def test_refresh_security_group_rules(self):
         self._test_compute_api('refresh_security_group_rules', 'cast',
@@ -182,6 +229,10 @@ class ComputeRpcAPITestCase(test.TestCase):
         self._test_compute_api('reset_network', 'cast',
                 instance=self.fake_instance)
 
+    def test_resize_instance(self):
+        self._test_compute_api('resize_instance', 'cast',
+                instance=self.fake_instance, migration_id='id', image='image')
+
     def test_resume_instance(self):
         self._test_compute_api('resume_instance', 'cast',
                 instance=self.fake_instance)
@@ -189,6 +240,10 @@ class ComputeRpcAPITestCase(test.TestCase):
     def test_revert_resize(self):
         self._test_compute_api('revert_resize', 'cast',
                 instance=self.fake_instance, migration_id='id', host='host')
+
+    def test_rollback_live_migration_at_destination(self):
+        self._test_compute_api('rollback_live_migration_at_destination',
+                'cast', instance=self.fake_instance, host='host')
 
     def test_set_admin_password(self):
         self._test_compute_api('set_admin_password', 'cast',
