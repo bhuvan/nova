@@ -51,7 +51,6 @@ A fake XenAPI SDK.
 """
 
 
-import json
 import random
 import uuid
 from xml.sax import saxutils
@@ -60,7 +59,8 @@ import pprint
 
 from nova import exception
 from nova import log as logging
-from nova import utils
+from nova.openstack.common import jsonutils
+from nova.openstack.common import timeutils
 
 
 _CLASSES = ['host', 'network', 'session', 'pool', 'SR', 'VBD',
@@ -276,16 +276,17 @@ def _create_object(table, obj):
 def _create_sr(table, obj):
     sr_type = obj[6]
     # Forces fake to support iscsi only
-    if sr_type != 'iscsi':
+    if sr_type != 'iscsi' and sr_type != 'nfs':
         raise Failure(['SR_UNKNOWN_DRIVER', sr_type])
     host_ref = _db_content['host'].keys()[0]
     sr_ref = _create_object(table, obj[2])
-    vdi_ref = create_vdi('', sr_ref)
-    pbd_ref = create_pbd('', host_ref, sr_ref, True)
-    _db_content['SR'][sr_ref]['VDIs'] = [vdi_ref]
-    _db_content['SR'][sr_ref]['PBDs'] = [pbd_ref]
-    _db_content['VDI'][vdi_ref]['SR'] = sr_ref
-    _db_content['PBD'][pbd_ref]['SR'] = sr_ref
+    if sr_type == 'iscsi':
+        vdi_ref = create_vdi('', sr_ref)
+        pbd_ref = create_pbd('', host_ref, sr_ref, True)
+        _db_content['SR'][sr_ref]['VDIs'] = [vdi_ref]
+        _db_content['SR'][sr_ref]['PBDs'] = [pbd_ref]
+        _db_content['VDI'][vdi_ref]['SR'] = sr_ref
+        _db_content['PBD'][pbd_ref]['SR'] = sr_ref
     return sr_ref
 
 
@@ -337,7 +338,7 @@ def as_json(*args, **kwargs):
     then these are rendered as a JSON list.  If it's given keyword
     arguments then these are rendered as a JSON dict."""
     arg = args or kwargs
-    return json.dumps(arg)
+    return jsonutils.dumps(arg)
 
 
 class Failure(Exception):
@@ -475,19 +476,14 @@ class SessionBase(object):
         name_label = db_ref['name_label']
         read_only = db_ref['read_only']
         sharable = db_ref['sharable']
-        vdi_ref = create_vdi(name_label, sr_ref, sharable=sharable,
-                             read_only=read_only)
-        return vdi_ref
+        other_config = db_ref['other_config'].copy()
+        return create_vdi(name_label, sr_ref, sharable=sharable,
+                          read_only=read_only, other_config=other_config)
 
     def VDI_clone(self, _1, vdi_to_clone_ref):
         db_ref = _db_content['VDI'][vdi_to_clone_ref]
-        name_label = db_ref['name_label']
-        read_only = db_ref['read_only']
         sr_ref = db_ref['SR']
-        sharable = db_ref['sharable']
-        vdi_ref = create_vdi(name_label, sr_ref, sharable=sharable,
-                             read_only=read_only)
-        return vdi_ref
+        return self.VDI_copy(_1, vdi_to_clone_ref, sr_ref)
 
     def host_compute_free_memory(self, _1, ref):
         #Always return 12GB available
@@ -515,17 +511,17 @@ class SessionBase(object):
         elif (plugin, method) == ('migration', 'transfer_vhd'):
             return ''
         elif (plugin, method) == ('xenhost', 'host_data'):
-            return json.dumps({'host_memory': {'total': 10,
-                                               'overhead': 20,
-                                               'free': 30,
-                                               'free-computed': 40}, })
+            return jsonutils.dumps({'host_memory': {'total': 10,
+                                                    'overhead': 20,
+                                                    'free': 30,
+                                                    'free-computed': 40}, })
         elif (plugin == 'xenhost' and method in ['host_reboot',
                                                  'host_startup',
                                                  'host_shutdown']):
-            return json.dumps({"power_action": method[5:]})
+            return jsonutils.dumps({"power_action": method[5:]})
         elif (plugin, method) == ('xenhost', 'set_host_enabled'):
             enabled = 'enabled' if _5.get('enabled') == 'true' else 'disabled'
-            return json.dumps({"status": enabled})
+            return jsonutils.dumps({"status": enabled})
         else:
             raise Exception('No simulation in host_call_plugin for %s,%s' %
                             (plugin, method))
@@ -744,7 +740,7 @@ class SessionBase(object):
         except Failure, exc:
             task['error_info'] = exc.details
             task['status'] = 'failed'
-        task['finished'] = utils.utcnow()
+        task['finished'] = timeutils.utcnow()
         return task_ref
 
     def _check_session(self, params):

@@ -20,7 +20,6 @@
 from __future__ import absolute_import
 
 import copy
-import json
 import random
 import sys
 import time
@@ -32,6 +31,8 @@ from nova import exception
 from nova import flags
 from nova import log as logging
 from nova.openstack.common import importutils
+from nova.openstack.common import jsonutils
+from nova.openstack.common import timeutils
 from nova import utils
 
 
@@ -88,13 +89,16 @@ def pick_glance_api_server():
     return host, port
 
 
-def get_glance_client(context, image_href):
+def _get_glance_client(context, image_href):
     """Get the correct glance client and id for the given image_href.
 
     The image_href param can be an href of the form
     http://myglanceserver:9292/images/42, or just an int such as 42. If the
     image_href is an int, then flags are used to create the default
     glance client.
+
+    NOTE: Do not use this or glance.client directly, all other code
+    should be using GlanceImageService.
 
     :param image_href: image ref/id for an image
     :returns: a tuple of the form (glance_client, image_id)
@@ -404,7 +408,7 @@ def _parse_glance_iso8601_timestamp(timestamp):
 
     for iso_format in iso_formats:
         try:
-            return utils.parse_strtime(timestamp, iso_format)
+            return timeutils.parse_strtime(timestamp, iso_format)
         except ValueError:
             pass
 
@@ -416,13 +420,13 @@ def _parse_glance_iso8601_timestamp(timestamp):
 def _json_loads(properties, attr):
     prop = properties[attr]
     if isinstance(prop, basestring):
-        properties[attr] = json.loads(prop)
+        properties[attr] = jsonutils.loads(prop)
 
 
 def _json_dumps(properties, attr):
     prop = properties[attr]
     if not isinstance(prop, basestring):
-        properties[attr] = json.dumps(prop)
+        properties[attr] = jsonutils.dumps(prop)
 
 
 _CONVERT_PROPS = ('block_device_mapping', 'mappings')

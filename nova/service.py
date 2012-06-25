@@ -35,7 +35,7 @@ from nova import flags
 from nova import log as logging
 from nova.openstack.common import cfg
 from nova.openstack.common import importutils
-from nova import rpc
+from nova.openstack.common import rpc
 from nova import utils
 from nova import version
 from nova import wsgi
@@ -61,18 +61,12 @@ service_opts = [
     cfg.IntOpt('ec2_listen_port',
                default=8773,
                help='port for ec2 api to listen'),
-    cfg.IntOpt('ec2_workers',
-               default=0,
-               help='Number of workers for EC2 API service'),
     cfg.StrOpt('osapi_compute_listen',
                default="0.0.0.0",
                help='IP address for OpenStack API to listen'),
     cfg.IntOpt('osapi_compute_listen_port',
                default=8774,
                help='list port for osapi compute'),
-    cfg.IntOpt('osapi_compute_workers',
-               default=0,
-               help='Number of workers for OpenStack API service'),
     cfg.StrOpt('metadata_manager',
                default='nova.api.manager.MetadataManager',
                help='OpenStack metadata service manager'),
@@ -82,18 +76,12 @@ service_opts = [
     cfg.IntOpt('metadata_listen_port',
                default=8775,
                help='port for metadata api to listen'),
-    cfg.IntOpt('metadata_workers',
-               default=0,
-               help='Number of workers for metadata service'),
     cfg.StrOpt('osapi_volume_listen',
                default="0.0.0.0",
                help='IP address for OpenStack Volume API to listen'),
     cfg.IntOpt('osapi_volume_listen_port',
                default=8776,
-               help='port for os volume api to listen'),
-    cfg.IntOpt('osapi_volume_workers',
-               default=0,
-               help='Number of workers for OpenStack Volume API service')
+               help='port for os volume api to listen')
     ]
 
 FLAGS = flags.FLAGS
@@ -147,6 +135,14 @@ class Launcher(object):
         :returns: None
 
         """
+        def sigterm(sig, frame):
+            LOG.audit(_("SIGTERM received"))
+            # NOTE(jk0): Raise a ^C which is caught by the caller and cleanly
+            # shuts down the service. This does not yet handle eventlet
+            # threads.
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, sigterm)
 
         for service in self._services:
             try:
@@ -183,7 +179,6 @@ class Service(object):
         LOG.audit(_('Starting %(topic)s node (version %(vcs_string)s)'),
                   {'topic': self.topic, 'vcs_string': vcs_string})
         utils.cleanup_file_locks()
-        rpc.register_opts(FLAGS)
         self.manager.init_host()
         self.model_disconnected = False
         ctxt = context.get_admin_context()
@@ -366,12 +361,10 @@ class WSGIService(object):
         self.app = self.loader.load_app(name)
         self.host = getattr(FLAGS, '%s_listen' % name, "0.0.0.0")
         self.port = getattr(FLAGS, '%s_listen_port' % name, 0)
-        self.workers = getattr(FLAGS, '%s_workers' % name, 0)
         self.server = wsgi.Server(name,
                                   self.app,
                                   host=self.host,
-                                  port=self.port,
-                                  workers=self.workers)
+                                  port=self.port)
 
     def _get_manager(self):
         """Initialize a Manager object appropriate for this service.
@@ -404,7 +397,6 @@ class WSGIService(object):
 
         """
         utils.cleanup_file_locks()
-        rpc.register_opts(FLAGS)
         if self.manager:
             self.manager.init_host()
         self.server.start()
@@ -445,7 +437,6 @@ def serve(*servers):
 
 def wait():
     LOG.debug(_('Full set of FLAGS:'))
-    rpc.register_opts(FLAGS)
     for flag in FLAGS:
         flag_get = FLAGS.get(flag, None)
         # hide flag contents from log if contains a password

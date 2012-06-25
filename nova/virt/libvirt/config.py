@@ -21,6 +21,7 @@ Classes to represent the configuration of various libvirt objects
 and support conversion to/from XML
 """
 
+from nova import exception
 from nova import log as logging
 
 from lxml import etree
@@ -38,9 +39,6 @@ class LibvirtConfigObject(object):
         self.ns_prefix = kwargs.get('ns_prefix')
         self.ns_uri = kwargs.get('ns_uri')
 
-        if "xml_str" in kwargs:
-            self.parse_dom(kwargs.get("xml_str"))
-
     def _text_node(self, name, value):
         child = etree.Element(name)
         child.text = str(value)
@@ -53,14 +51,77 @@ class LibvirtConfigObject(object):
             return etree.Element("{" + self.ns_uri + "}" + self.root_name,
                                  nsmap={self.ns_prefix: self.ns_uri})
 
-    def parse_dom(xmldoc):
-        raise NotImplementedError()
+    def parse_str(self, xmlstr):
+        self.parse_dom(etree.fromstring(xmlstr))
+
+    def parse_dom(self, xmldoc):
+        if self.root_name != xmldoc.tag:
+            raise exception.InvalidInput(
+                "Root element name should be '%s' not '%s'"
+                % (self.root_name, xmldoc.tag))
 
     def to_xml(self, pretty_print=True):
         root = self.format_dom()
         xml_str = etree.tostring(root, pretty_print=pretty_print)
         LOG.debug("Generated XML %s " % (xml_str,))
         return xml_str
+
+
+class LibvirtConfigGuestTimer(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestTimer, self).__init__(root_name="timer",
+                                                      **kwargs)
+
+        self.name = "platform"
+        self.track = None
+        self.tickpolicy = None
+        self.present = None
+
+    def format_dom(self):
+        tm = super(LibvirtConfigGuestTimer, self).format_dom()
+
+        tm.set("name", self.name)
+        if self.track is not None:
+            tm.set("track", self.track)
+        if self.tickpolicy is not None:
+            tm.set("tickpolicy", self.tickpolicy)
+        if self.present is not None:
+            if self.present:
+                tm.set("present", "yes")
+            else:
+                tm.set("present", "no")
+
+        return tm
+
+
+class LibvirtConfigGuestClock(LibvirtConfigObject):
+
+    def __init__(self, **kwargs):
+        super(LibvirtConfigGuestClock, self).__init__(root_name="clock",
+                                                      **kwargs)
+
+        self.offset = "utc"
+        self.adjustment = None
+        self.timezone = None
+        self.timers = []
+
+    def format_dom(self):
+        clk = super(LibvirtConfigGuestClock, self).format_dom()
+
+        clk.set("offset", self.offset)
+        if self.adjustment:
+            clk.set("adjustment", self.adjustment)
+        elif self.timezone:
+            clk.set("timezone", self.timezone)
+
+        for tm in self.timers:
+            clk.append(tm.format_dom())
+
+        return clk
+
+    def add_timer(self, tm):
+        self.timers.append(tm)
 
 
 class LibvirtConfigGuestDevice(LibvirtConfigObject):
@@ -306,6 +367,7 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self.memory = 1024 * 1024 * 500
         self.vcpus = 1
         self.acpi = False
+        self.clock = None
         self.os_type = None
         self.os_kernel = None
         self.os_initrd = None
@@ -360,12 +422,19 @@ class LibvirtConfigGuest(LibvirtConfigObject):
         self._format_basic_props(root)
         self._format_os(root)
         self._format_features(root)
+
+        if self.clock is not None:
+            root.append(self.clock.format_dom())
+
         self._format_devices(root)
 
         return root
 
     def add_device(self, dev):
         self.devices.append(dev)
+
+    def set_clock(self, clk):
+        self.clock = clk
 
 
 class LibvirtConfigCPU(LibvirtConfigObject):

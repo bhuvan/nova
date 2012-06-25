@@ -21,6 +21,8 @@
 
 import sys
 
+from nova.common import deprecated
+from nova import exception
 from nova import flags
 from nova import log as logging
 from nova.openstack.common import importutils
@@ -65,15 +67,13 @@ def get_connection(read_only=False):
                             * baremetal
 
     """
-    # TODO(termie): check whether we can be disconnected
-    # TODO(sdague): is there a better way to mark things deprecated
-    LOG.error(_('Specifying virt driver via connection_type is deprecated'))
+    deprecated.warn(_('Specifying virt driver via connection_type is '
+                      'deprecated. Use compute_driver=classname instead.'))
 
     driver_name = known_drivers.get(FLAGS.connection_type)
 
     if driver_name is None:
-        raise Exception('Unknown virt connection type "%s"' %
-                        FLAGS.connection_type)
+        raise exception.VirtDriverNotFound(name=FLAGS.connection_type)
 
     conn = importutils.import_object(driver_name, read_only=read_only)
 

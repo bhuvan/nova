@@ -31,9 +31,9 @@ from nova import flags
 from nova import log as logging
 from nova.notifier import test_notifier
 from nova.openstack.common import importutils
+from nova.openstack.common import rpc
 import nova.policy
 from nova import quota
-from nova import rpc
 from nova import test
 import nova.volume.api
 
@@ -59,7 +59,7 @@ class VolumeTestCase(test.TestCase):
         test_notifier.NOTIFICATIONS = []
 
     def tearDown(self):
-        db.instance_destroy(self.context, self.instance_id)
+        db.instance_destroy(self.context, self.instance_uuid)
         super(VolumeTestCase, self).tearDown()
 
     @staticmethod
@@ -239,7 +239,7 @@ class VolumeTestCase(test.TestCase):
                           db.volume_get,
                           self.context,
                           volume_id)
-        db.instance_destroy(self.context, instance_id)
+        db.instance_destroy(self.context, instance_uuid)
 
     def test_concurrent_volumes_get_different_targets(self):
         """Ensure multiple concurrent volumes get different targets."""

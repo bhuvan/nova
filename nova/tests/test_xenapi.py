@@ -22,35 +22,82 @@ import functools
 import os
 import re
 
-import mox
-
 from nova.compute import aggregate_states
 from nova.compute import instance_types
 from nova.compute import power_state
-from nova.compute import task_states
-from nova.compute import vm_states
 from nova import context
 from nova import db
 from nova import exception
 from nova import flags
+import nova.image.fake
 from nova import log as logging
 from nova.openstack.common import importutils
+from nova.openstack.common import timeutils
 from nova import test
 from nova.tests.db import fakes as db_fakes
 from nova.tests import fake_network
 from nova.tests import fake_utils
-from nova.tests.glance import stubs as glance_stubs
 from nova.tests.xenapi import stubs
-from nova import utils
 from nova.virt.xenapi import connection as xenapi_conn
 from nova.virt.xenapi import fake as xenapi_fake
 from nova.virt.xenapi import vm_utils
 from nova.virt.xenapi import vmops
 from nova.virt.xenapi import volume_utils
+import nova.tests.api.openstack.fakes as api_fakes
+
 
 LOG = logging.getLogger(__name__)
 
 FLAGS = flags.FLAGS
+
+IMAGE_MACHINE = '1'
+IMAGE_KERNEL = '2'
+IMAGE_RAMDISK = '3'
+IMAGE_RAW = '4'
+IMAGE_VHD = '5'
+IMAGE_ISO = '6'
+
+IMAGE_FIXTURES = {
+    IMAGE_MACHINE: {
+        'image_meta': {'name': 'fakemachine', 'size': 0,
+                       'disk_format': 'ami',
+                       'container_format': 'ami'},
+    },
+    IMAGE_KERNEL: {
+        'image_meta': {'name': 'fakekernel', 'size': 0,
+                       'disk_format': 'aki',
+                       'container_format': 'aki'},
+    },
+    IMAGE_RAMDISK: {
+        'image_meta': {'name': 'fakeramdisk', 'size': 0,
+                       'disk_format': 'ari',
+                       'container_format': 'ari'},
+    },
+    IMAGE_RAW: {
+        'image_meta': {'name': 'fakeraw', 'size': 0,
+                       'disk_format': 'raw',
+                       'container_format': 'bare'},
+    },
+    IMAGE_VHD: {
+        'image_meta': {'name': 'fakevhd', 'size': 0,
+                       'disk_format': 'vhd',
+                       'container_format': 'ovf'},
+    },
+    IMAGE_ISO: {
+        'image_meta': {'name': 'fakeiso', 'size': 0,
+                       'disk_format': 'iso',
+                       'container_format': 'bare'},
+    },
+}
+
+
+def set_image_fixtures():
+    image_service = nova.image.fake.FakeImageService()
+    image_service.delete_all()
+    for image_id, image_meta in IMAGE_FIXTURES.items():
+        image_meta = image_meta['image_meta']
+        image_meta['id'] = image_id
+        image_service.create(None, image_meta)
 
 
 def stub_vm_utils_with_vdi_attached_here(function, should_return=True):
@@ -66,23 +113,23 @@ def stub_vm_utils_with_vdi_attached_here(function, should_return=True):
             fake_dev = 'fakedev'
             yield fake_dev
 
-        def fake_stream_disk(*args, **kwargs):
+        def fake_image_service_get(*args, **kwargs):
             pass
 
         def fake_is_vdi_pv(*args, **kwargs):
             return should_return
 
         orig_vdi_attached_here = vm_utils.vdi_attached_here
-        orig_stream_disk = vm_utils._stream_disk
+        orig_image_service_get = nova.image.fake._FakeImageService.get
         orig_is_vdi_pv = vm_utils._is_vdi_pv
         try:
             vm_utils.vdi_attached_here = fake_vdi_attached_here
-            vm_utils._stream_disk = fake_stream_disk
+            nova.image.fake._FakeImageService.get = fake_image_service_get
             vm_utils._is_vdi_pv = fake_is_vdi_pv
             return function(self, *args, **kwargs)
         finally:
             vm_utils._is_vdi_pv = orig_is_vdi_pv
-            vm_utils._stream_disk = orig_stream_disk
+            nova.image.fake._FakeImageService.get = orig_image_service_get
             vm_utils.vdi_attached_here = orig_vdi_attached_here
 
     return decorated_function
@@ -113,7 +160,7 @@ class XenAPIVolumeTestCase(test.TestCase):
                   'os_type': 'linux',
                   'architecture': 'x86-64'}
 
-    def _create_volume(self, size='0'):
+    def _create_volume(self, size=0):
         """Create a volume object."""
         vol = {}
         vol['size'] = size
@@ -157,8 +204,7 @@ class XenAPIVolumeTestCase(test.TestCase):
         }
 
         for (input, expected) in cases.iteritems():
-            func = volume_utils.VolumeHelper.mountpoint_to_number
-            actual = func(input)
+            actual = volume_utils.mountpoint_to_number(input)
             self.assertEqual(actual, expected,
                     '%s yielded %s, not %s' % (input, actual, expected))
 
@@ -169,7 +215,7 @@ class XenAPIVolumeTestCase(test.TestCase):
         vol = self._create_volume()
         # oops, wrong mount point!
         self.assertRaises(volume_utils.StorageError,
-                          volume_utils.VolumeHelper.parse_volume_info,
+                          volume_utils.parse_volume_info,
                           self._make_info(),
                           'dev/sd'
                           )
@@ -224,15 +270,22 @@ class XenAPIVMTestCase(test.TestCase):
         xenapi_fake.create_network('fake', FLAGS.flat_network_bridge)
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         stubs.stubout_get_this_vm_uuid(self.stubs)
-        stubs.stubout_stream_disk(self.stubs)
         stubs.stubout_is_vdi_pv(self.stubs)
         stubs.stub_out_vm_methods(self.stubs)
-        glance_stubs.stubout_glance_client(self.stubs)
         fake_utils.stub_out_utils_execute(self.stubs)
         self.user_id = 'fake'
         self.project_id = 'fake'
         self.context = context.RequestContext(self.user_id, self.project_id)
         self.conn = xenapi_conn.XenAPIDriver(False)
+
+        api_fakes.stub_out_image_service(self.stubs)
+        set_image_fixtures()
+        stubs.stubout_image_service_get(self.stubs)
+        stubs.stubout_stream_disk(self.stubs)
+
+    def tearDown(self):
+        super(XenAPIVMTestCase, self).tearDown()
+        nova.image.fake.FakeImageService_reset()
 
     def test_init_host(self):
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
@@ -482,7 +535,7 @@ class XenAPIVMTestCase(test.TestCase):
         # admin_pass isn't part of the DB model, but it does get set as
         # an attribute for spawn to use
         instance.admin_pass = 'herp'
-        image_meta = {'id': glance_stubs.FakeGlance.IMAGE_VHD,
+        image_meta = {'id': IMAGE_VHD,
                       'disk_format': 'vhd'}
         self.conn.spawn(self.context, instance, image_meta, network_info)
         self.create_vm_record(self.conn, os_type, instance['name'])
@@ -492,7 +545,7 @@ class XenAPIVMTestCase(test.TestCase):
 
     def test_spawn_empty_dns(self):
         """Test spawning with an empty dns list"""
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_VHD, None, None,
+        self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64",
                          empty_dns=True)
         self.check_vm_params_for_linux()
@@ -532,11 +585,11 @@ class XenAPIVMTestCase(test.TestCase):
 
     @stub_vm_utils_with_vdi_attached_here
     def test_spawn_raw_glance(self):
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_RAW, None, None)
+        self._test_spawn(IMAGE_RAW, None, None)
         self.check_vm_params_for_linux()
 
     def test_spawn_vhd_glance_linux(self):
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_VHD, None, None,
+        self._test_spawn(IMAGE_VHD, None, None,
                          os_type="linux", architecture="x86-64")
         self.check_vm_params_for_linux()
 
@@ -565,20 +618,20 @@ class XenAPIVMTestCase(test.TestCase):
         self.assertEqual(len(self.vm['VBDs']), 1)
 
     def test_spawn_vhd_glance_windows(self):
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_VHD, None, None,
+        self._test_spawn(IMAGE_VHD, None, None,
                          os_type="windows", architecture="i386")
         self.check_vm_params_for_windows()
 
     def test_spawn_iso_glance(self):
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_ISO, None, None,
+        self._test_spawn(IMAGE_ISO, None, None,
                          os_type="windows", architecture="i386")
         self.check_vm_params_for_windows()
 
     def test_spawn_glance(self):
         stubs.stubout_fetch_image_glance_disk(self.stubs)
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_MACHINE,
-                         glance_stubs.FakeGlance.IMAGE_KERNEL,
-                         glance_stubs.FakeGlance.IMAGE_RAMDISK)
+        self._test_spawn(IMAGE_MACHINE,
+                         IMAGE_KERNEL,
+                         IMAGE_RAMDISK)
         self.check_vm_params_for_linux_with_external_kernel()
 
     def test_spawn_netinject_file(self):
@@ -608,9 +661,9 @@ class XenAPIVMTestCase(test.TestCase):
             # Capture the tee .../etc/network/interfaces command
             (r'tee.*interfaces', _tee_handler),
         ])
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_MACHINE,
-                         glance_stubs.FakeGlance.IMAGE_KERNEL,
-                         glance_stubs.FakeGlance.IMAGE_RAMDISK,
+        self._test_spawn(IMAGE_MACHINE,
+                         IMAGE_KERNEL,
+                         IMAGE_RAMDISK,
                          check_injection=True)
         self.assertTrue(self._tee_executed)
 
@@ -659,8 +712,7 @@ class XenAPIVMTestCase(test.TestCase):
         self.assertFalse(self._tee_executed)
 
     def test_spawn_vlanmanager(self):
-        self.flags(image_service='nova.image.glance.GlanceImageService',
-                   network_manager='nova.network.manager.VlanManager',
+        self.flags(network_manager='nova.network.manager.VlanManager',
                    vlan_interface='fake0')
 
         def dummy(*args, **kwargs):
@@ -683,9 +735,9 @@ class XenAPIVMTestCase(test.TestCase):
                           vpn=None,
                           rxtx_factor=3,
                           project_id=self.project_id)
-        self._test_spawn(glance_stubs.FakeGlance.IMAGE_MACHINE,
-                         glance_stubs.FakeGlance.IMAGE_KERNEL,
-                         glance_stubs.FakeGlance.IMAGE_RAMDISK,
+        self._test_spawn(IMAGE_MACHINE,
+                         IMAGE_KERNEL,
+                         IMAGE_RAMDISK,
                          instance_id=2,
                          create_record=False)
         # TODO(salvatore-orlando): a complete test here would require
@@ -703,19 +755,19 @@ class XenAPIVMTestCase(test.TestCase):
     def test_rescue(self):
         instance = self._create_instance()
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
-        vm_ref = vm_utils.VMHelper.lookup(session, instance.name)
+        vm_ref = vm_utils.lookup(session, instance.name)
 
         xenapi_fake.create_vbd(vm_ref, "swap", userdevice=1)
         xenapi_fake.create_vbd(vm_ref, "rootfs", userdevice=0)
 
         conn = xenapi_conn.XenAPIDriver(False)
-        image_meta = {'id': glance_stubs.FakeGlance.IMAGE_VHD,
+        image_meta = {'id': IMAGE_VHD,
                       'disk_format': 'vhd'}
         conn.rescue(self.context, instance, [], image_meta)
 
         vm = xenapi_fake.get_record('VM', vm_ref)
         rescue_name = "%s-rescue" % vm["name_label"]
-        rescue_ref = vm_utils.VMHelper.lookup(session, rescue_name)
+        rescue_ref = vm_utils.lookup(session, rescue_name)
         rescue_vm = xenapi_fake.get_record('VM', rescue_ref)
 
         vdi_uuids = []
@@ -770,7 +822,7 @@ class XenAPIVMTestCase(test.TestCase):
         instance = db.instance_create(self.context, instance_values)
         network_info = fake_network.fake_get_instance_nw_info(self.stubs,
                                                               spectacular=True)
-        image_meta = {'id': glance_stubs.FakeGlance.IMAGE_VHD,
+        image_meta = {'id': IMAGE_VHD,
                       'disk_format': 'vhd'}
         if spawn:
             instance.admin_pass = 'herp'
@@ -860,7 +912,6 @@ class XenAPIMigrateInstance(test.TestCase):
         fake_utils.stub_out_utils_execute(self.stubs)
         stubs.stub_out_migration_methods(self.stubs)
         stubs.stubout_get_this_vm_uuid(self.stubs)
-        glance_stubs.stubout_glance_client(self.stubs)
 
     def test_resize_xenserver_6(self):
         instance = db.instance_create(self.context, self.instance_values)
@@ -876,7 +927,8 @@ class XenAPIMigrateInstance(test.TestCase):
         conn = xenapi_conn.XenAPIDriver(False)
         vdi_ref = xenapi_fake.create_vdi('hurr', 'fake')
         vdi_uuid = xenapi_fake.get_record('VDI', vdi_ref)['uuid']
-        conn._vmops._resize_instance(instance, vdi_uuid)
+        conn._vmops._resize_instance(instance,
+                                     {'uuid': vdi_uuid, 'ref': vdi_ref})
         self.assertEqual(called['resize'], True)
 
     def test_migrate_disk_and_power_off(self):
@@ -1023,7 +1075,6 @@ class XenAPIDetermineDiskImageTestCase(test.TestCase):
     """Unit tests for code that detects the ImageType."""
     def setUp(self):
         super(XenAPIDetermineDiskImageTestCase, self).setUp()
-        glance_stubs.stubout_glance_client(self.stubs)
 
         class FakeInstance(object):
             pass
@@ -1034,7 +1085,7 @@ class XenAPIDetermineDiskImageTestCase(test.TestCase):
         self.fake_instance.architecture = 'x86-64'
 
     def assert_disk_type(self, image_meta, expected_disk_type):
-        actual = vm_utils.VMHelper.determine_disk_image_type(image_meta)
+        actual = vm_utils.determine_disk_image_type(image_meta)
         self.assertEqual(expected_disk_type, actual)
 
     def test_machine(self):
@@ -1153,14 +1204,11 @@ class XenAPIAutoDiskConfigTestCase(test.TestCase):
 
         self.context = context.RequestContext(self.user_id, self.project_id)
 
-        @classmethod
-        def fake_create_vbd(cls, session, vm_ref, vdi_ref, userdevice,
+        def fake_create_vbd(session, vm_ref, vdi_ref, userdevice,
                             vbd_type='disk', read_only=False, bootable=True):
             pass
 
-        self.stubs.Set(vm_utils.VMHelper,
-                       "create_vbd",
-                       fake_create_vbd)
+        self.stubs.Set(vm_utils, 'create_vbd', fake_create_vbd)
 
     def assertIsPartitionCalled(self, called):
         marker = {"partition_called": False}
@@ -1170,14 +1218,18 @@ class XenAPIAutoDiskConfigTestCase(test.TestCase):
         self.stubs.Set(vm_utils, "_resize_part_and_fs",
                        fake_resize_part_and_fs)
 
-        instance = db.instance_create(self.context, self.instance_values)
-        disk_image_type = vm_utils.ImageType.DISK_VHD
-        vm_ref = "blah"
-        first_vdi_ref = "blah"
-        vdis = ["blah"]
+        ctx = context.RequestContext(self.user_id, self.project_id)
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
 
-        self.conn._vmops._attach_disks(
-            instance, disk_image_type, vm_ref, first_vdi_ref, vdis)
+        disk_image_type = vm_utils.ImageType.DISK_VHD
+        instance = db.instance_create(self.context, self.instance_values)
+        vm_ref = xenapi_fake.create_vm(instance['name'], 'Halted')
+        vdi_ref = xenapi_fake.create_vdi(instance['name'], 'fake')
+
+        vdi_uuid = session.call_xenapi('VDI.get_record', vdi_ref)['uuid']
+        vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
+
+        self.conn._vmops._attach_disks(instance, disk_image_type, vm_ref, vdis)
 
         self.assertEqual(marker["partition_called"], called)
 
@@ -1246,51 +1298,48 @@ class XenAPIGenerateLocal(test.TestCase):
 
         self.context = context.RequestContext(self.user_id, self.project_id)
 
-        @classmethod
-        def fake_create_vbd(cls, session, vm_ref, vdi_ref, userdevice,
+        def fake_create_vbd(session, vm_ref, vdi_ref, userdevice,
                             vbd_type='disk', read_only=False, bootable=True):
             pass
 
-        self.stubs.Set(vm_utils.VMHelper,
-                       "create_vbd",
-                       fake_create_vbd)
+        self.stubs.Set(vm_utils, 'create_vbd', fake_create_vbd)
 
     def assertCalled(self, instance):
+        ctx = context.RequestContext(self.user_id, self.project_id)
+        session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
+
         disk_image_type = vm_utils.ImageType.DISK_VHD
-        vm_ref = "blah"
-        first_vdi_ref = "blah"
-        vdis = ["blah"]
+        vm_ref = xenapi_fake.create_vm(instance['name'], 'Halted')
+        vdi_ref = xenapi_fake.create_vdi(instance['name'], 'fake')
+
+        vdi_uuid = session.call_xenapi('VDI.get_record', vdi_ref)['uuid']
+        vdis = {'root': {'uuid': vdi_uuid, 'ref': vdi_ref}}
 
         self.called = False
-        self.conn._vmops._attach_disks(instance, disk_image_type,
-                                       vm_ref, first_vdi_ref, vdis)
+        self.conn._vmops._attach_disks(instance, disk_image_type, vm_ref, vdis)
         self.assertTrue(self.called)
 
     def test_generate_swap(self):
         """Test swap disk generation."""
         instance = db.instance_create(self.context, self.instance_values)
-        instance = db.instance_update(self.context, instance['id'],
+        instance = db.instance_update(self.context, instance['uuid'],
                                       {'instance_type_id': 5})
 
-        @classmethod
-        def fake_generate_swap(cls, *args, **kwargs):
+        def fake_generate_swap(*args, **kwargs):
             self.called = True
-        self.stubs.Set(vm_utils.VMHelper, 'generate_swap',
-                       fake_generate_swap)
+        self.stubs.Set(vm_utils, 'generate_swap', fake_generate_swap)
 
         self.assertCalled(instance)
 
     def test_generate_ephemeral(self):
         """Test ephemeral disk generation."""
         instance = db.instance_create(self.context, self.instance_values)
-        instance = db.instance_update(self.context, instance['id'],
+        instance = db.instance_update(self.context, instance['uuid'],
                                       {'instance_type_id': 4})
 
-        @classmethod
-        def fake_generate_ephemeral(cls, *args):
+        def fake_generate_ephemeral(*args):
             self.called = True
-        self.stubs.Set(vm_utils.VMHelper, 'generate_ephemeral',
-                       fake_generate_ephemeral)
+        self.stubs.Set(vm_utils, 'generate_ephemeral', fake_generate_ephemeral)
 
         self.assertCalled(instance)
 
@@ -1298,7 +1347,7 @@ class XenAPIGenerateLocal(test.TestCase):
 class XenAPIBWUsageTestCase(test.TestCase):
     def setUp(self):
         super(XenAPIBWUsageTestCase, self).setUp()
-        self.stubs.Set(vm_utils.VMHelper, "compile_metrics",
+        self.stubs.Set(vm_utils, 'compile_metrics',
                        XenAPIBWUsageTestCase._fake_compile_metrics)
         self.flags(target_host='127.0.0.1',
                    xenapi_connection_url='test_url',
@@ -1322,7 +1371,8 @@ class XenAPIBWUsageTestCase(test.TestCase):
                 self.name = "instance-0001"
                 self.uuid = "1-2-3-4-5"
 
-        result = self.conn.get_all_bw_usage([testinstance()], utils.utcnow())
+        result = self.conn.get_all_bw_usage([testinstance()],
+                                            timeutils.utcnow())
         self.assertEqual(result, [])
 
 
@@ -1506,7 +1556,7 @@ class XenAPIDom0IptablesFirewallTestCase(test.TestCase):
             self.assertTrue(len(filter(regex.match, self._out_rules)) > 0,
                             "TCP port 80/81 acceptance rule wasn't added")
 
-        db.instance_destroy(admin_ctxt, instance_ref['id'])
+        db.instance_destroy(admin_ctxt, instance_ref['uuid'])
 
     def test_filters_for_instance_with_ip_v6(self):
         self.flags(use_ipv6=True)
@@ -1642,7 +1692,7 @@ class XenAPISRSelectionTestCase(test.TestCase):
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
         self.assertRaises(exception.StorageRepositoryNotFound,
-                          vm_utils.VMHelper.safe_find_sr, session)
+                          vm_utils.safe_find_sr, session)
 
     def test_safe_find_sr_local_storage(self):
         """Ensure the default local-storage is found."""
@@ -1657,7 +1707,7 @@ class XenAPISRSelectionTestCase(test.TestCase):
                                             'Local storage',
                                             'i18n-key': 'local-storage'},
                               host_ref=host_ref)
-        expected = vm_utils.VMHelper.safe_find_sr(session)
+        expected = vm_utils.safe_find_sr(session)
         self.assertEqual(local_sr, expected)
 
     def test_safe_find_sr_by_other_criteria(self):
@@ -1670,7 +1720,7 @@ class XenAPISRSelectionTestCase(test.TestCase):
                                          type='lvm',
                                          other_config={'my_fake_sr': 'true'},
                                          host_ref=host_ref)
-        expected = vm_utils.VMHelper.safe_find_sr(session)
+        expected = vm_utils.safe_find_sr(session)
         self.assertEqual(local_sr, expected)
 
     def test_safe_find_sr_default(self):
@@ -1679,7 +1729,7 @@ class XenAPISRSelectionTestCase(test.TestCase):
         stubs.stubout_session(self.stubs, stubs.FakeSessionForVMTests)
         session = xenapi_conn.XenAPISession('test_url', 'root', 'test_pass')
         pool_ref = xenapi_fake.create_pool('')
-        expected = vm_utils.VMHelper.safe_find_sr(session)
+        expected = vm_utils.safe_find_sr(session)
         self.assertEqual(session.call_xenapi('pool.get_default_SR', pool_ref),
                          expected)
 

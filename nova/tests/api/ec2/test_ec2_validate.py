@@ -16,14 +16,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import webob.exc
-
 from nova.api.ec2 import cloud
-from nova.api.ec2 import ec2utils
-from nova.api.ec2 import inst_state
-from nova.compute import power_state
 from nova.compute import utils as compute_utils
-from nova.compute import vm_states
 from nova import context
 from nova import db
 from nova import exception
@@ -31,7 +25,7 @@ from nova import flags
 from nova.image import fake
 from nova import log as logging
 from nova.openstack.common import importutils
-from nova import rpc
+from nova.openstack.common import rpc
 from nova import test
 
 LOG = logging.getLogger(__name__)

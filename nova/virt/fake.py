@@ -46,7 +46,7 @@ class FakeInstance(object):
 class FakeDriver(driver.ComputeDriver):
     """Fake hypervisor driver"""
 
-    def __init__(self, readonly=False):
+    def __init__(self, read_only=False):
         self.instances = {}
         self.host_status = {
           'host_name-description': 'Fake Host',
@@ -117,6 +117,9 @@ class FakeDriver(driver.ComputeDriver):
     def agent_update(self, instance, url, md5hash):
         pass
 
+    def resume_state_on_host_boot(self, context, instance, network_info):
+        pass
+
     def rescue(self, context, instance, network_info, image_meta):
         pass
 
@@ -134,6 +137,12 @@ class FakeDriver(driver.ComputeDriver):
         pass
 
     def finish_revert_migration(self, instance, network_info):
+        pass
+
+    def power_off(self, instance):
+        pass
+
+    def power_on(self, instance):
         pass
 
     def pause(self, instance):
